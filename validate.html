@@ -1,0 +1,2590 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trebuchet Validation Arena</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #111; font-family: 'Segoe UI', Arial, sans-serif; }
+#info {
+  position: absolute; top: 20px; left: 20px; z-index: 10;
+  color: #fff; background: rgba(0,0,0,0.75); padding: 14px 20px;
+  border-radius: 8px; font-size: 14px; min-width: 260px;
+  pointer-events: none; border: 1px solid rgba(255,255,255,0.1);
+}
+#info .log-entry { color: #8cf; margin-top: 4px; font-size: 13px; }
+#info .log-entry.hit { color: #f66; font-weight: bold; }
+#info .status { color: #aaa; font-size: 12px; margin-top: 2px; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+
+<div id="info">
+  <div><strong>Trebuchet Validation Arena</strong>  <span id="score-display" style="float:right;color:#ffcc44;">Score: 0</span></div>
+  <div class="status" id="status-msg">Ready. Adjust parameters and press FIRE.</div>
+  <div id="log-container"></div>
+</div>
+
+<input type="file" id="csvInput" accept=".csv" style="display:none">
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/",
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as CANNON from 'cannon-es';
+import GUI from 'lil-gui';
+
+const RAD = Math.PI / 180;
+
+const config = {
+  posX: 0,
+  posZ: 2.5,
+  heading: 0,
+  pivotHeight: 1.0,
+  armMass: 4,
+  baseMass: 5,
+  motorTorque: 50,
+  leverLengthLoad: 1.0,
+  leverLengthCW: 0.5,
+  releaseAngle: 95,
+  modelScale: 0.001,
+  meshOffsetX: 0.026834891011241178,
+  meshOffsetY: -0.04495506623028258,
+  meshOffsetZ: 0.11745446247127002,
+  basePivotX: -0.23770602831864113,
+  basePivotY: 0.5103886551333617,
+  basePivotZ: 0.2807155949677642,
+  ballOffsetX: -1.0978787323707632e-9,
+  ballOffsetY: 0.1050171276281931,
+  ballOffsetZ: 0.6686593295498562,
+};
+
+const INITIAL_ARM_ANGLE = 45 * RAD;
+
+let scene, camera, renderer, controls;
+let world;
+let trebuchetGroup, boardGroup;
+let armMesh, ballMesh, armGroup, baseGroup, pivotDot, pivotDotOrange, pivotDotGreen, transformCtrl, gizmoTarget = 'Arm Pivot';
+let armBody, mountBody, ballBody;
+let hingeConstraint;
+let ballMat, wallMat;
+let trajectoryPoints = [];
+let trailLine, trailBuffer;
+const MAX_TRAIL = 800;
+let fired = false, released = false, landed = false, hasHit = false;
+let _stallFrames = 0;
+let score = 0;
+let boundingBox = null;
+let glbBase = null, glbArm = null;
+let _boardCrossY = null;
+let _boardCrossVx = null, _boardCrossVy = null, _boardCrossVz = null;
+let _lastHitProximity = 0, _lastHitQuality = '';
+const glbLoader = new GLTFLoader();
+const MODEL_PATH = './models/';
+function loadGLBModels() {
+  glbLoader.load(MODEL_PATH + 'robot_base.glb', (gltf) => {
+    glbBase = gltf.scene;
+    glbBase.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    glbBase.rotation.x = Math.PI / 2;
+    glbBase.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    if (!fired) resetSim();
+  }, undefined, () => { glbBase = null; });
+  glbLoader.load(MODEL_PATH + 'robot_arm.glb', (gltf) => {
+    glbArm = gltf.scene;
+    glbArm.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    glbArm.rotation.x = -48 * RAD;
+    glbArm.rotation.z = -Math.PI / 2;
+    glbArm.rotation.y = Math.PI;
+    glbArm.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    if (!fired) resetSim();
+  }, undefined, () => { glbArm = null; });
+}
+let clock;
+let firedTime = 0;
+let firedWallTime = 0;
+let hitTargets = [];
+let targetIdCounter = 0;
+const statusMsg = document.getElementById('status-msg');
+const logContainer = document.getElementById('log-container');
+
+// Half-life trial counts per validation level: 100 → 50 → 25 → 12 → 6 → 3
+const VAL_LEVEL_TRIALS = [100, 50, 25, 12, 6, 3];
+const VAL_THRESHOLD = 0.95;
+
+// Validator: per-target progressive validation with half-life decay succession
+const validator = {
+  running: false,
+  targetOrder: [],
+  currentTargetIdx: 0,
+  validatedTargets: [], // { targetId, params, acc, trials, level }
+  failedTargets: [],    // { targetId, level, bestAcc }
+
+  sets: [],
+  currentSetIdx: 0,
+  trialInSet: 0,
+  hitsOnTarget: 0,
+
+  validationLevel: 0,
+  levelTrials: VAL_LEVEL_TRIALS[0],
+
+  validatedCounts: {},  // { targetId: [counts per level] }
+
+  results: {},
+  totalTrials: 0,
+
+  _bestAcc: 0,
+  _bestParams: null,
+};
+
+const STORAGE_KEY = 'trebuchet_validation';
+let trainingData = { targetOrder: [], validatedTargets: [], failedTargets: [], validationLevel: 0, results: {}, totalTrials: 0, trials: [] };
+
+
+const FEASIBLE = {
+  posX: [-0.8, 0.8],
+  posZ: [1.5, 4.0],
+  heading: [-20, 20],
+  pivotHeight: [0.5, 1.5],
+  motorTorque: [5, 200],
+  leverLengthLoad: [0.4, 1.8],
+  leverLengthCW: [0.2, 1.0],
+  releaseAngle: [75, 115],
+};
+const FIXED_PARAMS = new Set(['pivotHeight', 'leverLengthLoad', 'leverLengthCW']);
+
+// ===== Target Board Geometry =====
+const BOARD = {
+  centerX: 0, centerY: 1.7, centerZ: 7.5,
+  halfW: 1.5, halfH: 1.7,
+  holes: [
+    { id: 't0', x: -0.9, y: 1.4, r: 0.2 },
+    { id: 't1', x:    0, y: 1.4, r: 0.2 },
+    { id: 't2', x:  0.9, y: 1.4, r: 0.2 },
+    { id: 't3', x: -0.9, y: 2.0, r: 0.2 },
+    { id: 't4', x:    0, y: 2.0, r: 0.2 },
+    { id: 't5', x:  0.9, y: 2.0, r: 0.2 },
+    { id: 't6', x: -0.9, y: 2.6, r: 0.2 },
+    { id: 't7', x:    0, y: 2.6, r: 0.2 },
+    { id: 't8', x:  0.9, y: 2.6, r: 0.2 },
+    { id: 't9',  x: -0.9, y: 3.15, r: 0.1 },
+    { id: 't10', x:    0, y: 3.15, r: 0.1 },
+    { id: 't11', x:  0.9, y: 3.15, r: 0.1 },
+  ],
+};
+function getTargetCenter(id) {
+  const h = BOARD.holes.find(h => h.id === id);
+  return h ? { x: h.x, y: h.y, z: BOARD.centerZ } : { x: 0, y: 0, z: 7.5 };
+}
+
+// ===== Validation Statistics =====
+
+function computeStats(results) {
+  const total = results.total || 0;
+  const hits = results.hits || 0;
+  const acc = total > 0 ? hits / total : 0;
+  const landZArr = results.landZ || [];
+  const avgZ = landZArr.length > 0 ? landZArr.reduce((a, b) => a + b, 0) / landZArr.length : null;
+  const stdZ = landZArr.length > 1
+    ? Math.sqrt(landZArr.reduce((s, z) => s + (z - avgZ) ** 2, 0) / (landZArr.length - 1))
+    : null;
+  const reliability = acc * (1 - (stdZ != null ? Math.min(stdZ / 3, 0.5) : 0.25)) * 100;
+  // Proximity stats
+  const proxArr = (results.proximity || []).filter(p => p > 0);
+  const avgProx = proxArr.length > 0 ? proxArr.reduce((a, b) => a + b, 0) / proxArr.length : 0;
+  const qualities = results.hitQualities || [];
+  const cleanCount = qualities.filter(q => q === 'clean').length;
+  const deflectCount = qualities.filter(q => q === 'deflect').length;
+  return { total, hits, acc: acc * 100, avgZ, stdZ, reliability, avgProx, cleanCount, deflectCount };
+}
+
+// Center-out target order (same as training arena)
+function buildTargetOrder() {
+  if (validator.targetOrder.length > 0) return;
+  // t0-t8 standard, t9-t11 bonus; order: center out
+  validator.targetOrder = ['t4','t1','t3','t7','t5','t0','t2','t6','t8','t9','t10','t11'];
+}
+
+function currentTargetId() {
+  if (validator.currentTargetIdx < 0 || validator.currentTargetIdx >= validator.targetOrder.length) return null;
+  return validator.targetOrder[validator.currentTargetIdx];
+}
+
+function isTargetSolved(targetId) {
+  return validator.validatedTargets.some(v => v.targetId === targetId && v.level === validator.validationLevel);
+}
+
+function targetTrialCount() {
+  return VAL_LEVEL_TRIALS[Math.min(validator.validationLevel, VAL_LEVEL_TRIALS.length - 1)];
+}
+
+function reportToTraining() {
+  const raw = localStorage.getItem('trebuchet_ai_training');
+  if (!raw) return;
+  try {
+    const d = JSON.parse(raw);
+    d.validatedParams = d.validatedParams || {};
+    for (const vt of validator.validatedTargets) {
+      if (!d.validatedParams[vt.targetId] || vt.level <= d.validatedParams[vt.targetId].level) {
+        d.validatedParams[vt.targetId] = { params: vt.params, acc: vt.acc, trials: vt.trials, level: vt.level };
+      }
+    }
+    localStorage.setItem('trebuchet_ai_training', JSON.stringify(d));
+  } catch(e) {}
+}
+
+function log(msg, isHit = false) {
+  const div = document.createElement('div');
+  div.className = 'log-entry' + (isHit ? ' hit' : '');
+  div.textContent = msg;
+  logContainer.appendChild(div);
+  if (logContainer.children.length > 50) logContainer.removeChild(logContainer.firstChild);
+}
+
+function setStatus(msg) { statusMsg.textContent = msg; }
+function updateScoreDisplay() { document.getElementById('score-display').textContent = `Score: ${score}`; }
+const TARGET_POINTS = { standard: 1, bonus: 3 };
+
+let targetCircles = [];
+
+function initScene() {
+  clock = new THREE.Clock();
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+  scene.fog = new THREE.Fog(0x1a1a2e, 25, 45);
+
+  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 60);
+  camera.position.set(8, 6, 10);
+  camera.lookAt(0, 1, 4);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.2;
+  document.body.appendChild(renderer.domElement);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.5, 4);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.maxPolarAngle = Math.PI / 2.05;
+  controls.update();
+
+  transformCtrl = new TransformControls(camera, renderer.domElement);
+  transformCtrl.setMode('translate');
+  transformCtrl.setSize(0.6);
+  transformCtrl.addEventListener('dragging-changed', e => { controls.enabled = !e.value; });
+  transformCtrl.addEventListener('change', () => {
+    if (transformCtrl.object === pivotDot && pivotDot && armMesh) {
+      config.meshOffsetX = pivotDot.position.x;
+      config.meshOffsetY = pivotDot.position.y;
+      config.meshOffsetZ = pivotDot.position.z;
+      armMesh.position.copy(pivotDot.position);
+    }
+    if (transformCtrl.object === pivotDotGreen && pivotDotGreen) {
+      config.ballOffsetX = pivotDotGreen.position.x;
+      config.ballOffsetY = pivotDotGreen.position.y;
+      config.ballOffsetZ = pivotDotGreen.position.z + config.leverLengthLoad;
+    }
+  });
+  transformCtrl.addEventListener('mouseUp', () => {
+    if (transformCtrl.object === pivotDotOrange && pivotDotOrange && baseGroup) {
+      const local = new THREE.Vector3();
+      baseGroup.worldToLocal(local.copy(pivotDotOrange.position));
+      config.basePivotX = local.x;
+      config.basePivotY = local.y;
+      config.basePivotZ = local.z;
+      if (!fired) resetSim();
+    }
+    if (transformCtrl.object === pivotDotGreen && pivotDotGreen && armGroup) {
+      config.ballOffsetX = pivotDotGreen.position.x;
+      config.ballOffsetY = pivotDotGreen.position.y;
+      config.ballOffsetZ = pivotDotGreen.position.z + config.leverLengthLoad;
+      if (!fired) resetSim();
+    }
+  });
+  scene.add(transformCtrl);
+
+  const ambient = new THREE.AmbientLight(0x404060, 0.6);
+  scene.add(ambient);
+
+  const hemi = new THREE.HemisphereLight(0x87ceeb, 0x362d1a, 0.8);
+  scene.add(hemi);
+
+  const sun = new THREE.DirectionalLight(0xffeedd, 2.2);
+  sun.position.set(10, 15, 5);
+  sun.castShadow = true;
+  sun.shadow.mapSize.width = 2048;
+  sun.shadow.mapSize.height = 2048;
+  sun.shadow.camera.near = 0.5;
+  sun.shadow.camera.far = 35;
+  sun.shadow.camera.left = -12;
+  sun.shadow.camera.right = 12;
+  sun.shadow.camera.top = 12;
+  sun.shadow.camera.bottom = -4;
+  scene.add(sun);
+
+  const fill = new THREE.DirectionalLight(0x8888ff, 0.4);
+  fill.position.set(-5, 3, -8);
+  scene.add(fill);
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+function initPhysics() {
+  world = new CANNON.World();
+  world.gravity.set(0, 0, 0);
+  world.broadphase = new CANNON.SAPBroadphase(world);
+  world.allowSleep = true;
+  world.solver.iterations = 20;
+
+  const groundMat = new CANNON.Material('ground');
+  ballMat = new CANNON.Material('ball');
+  wallMat = new CANNON.Material('wall');
+
+  const groundShape = new CANNON.Plane();
+  const groundBody = new CANNON.Body({ mass: 0, material: groundMat });
+  groundBody.addShape(groundShape);
+  groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+  world.addBody(groundBody);
+
+  world.addContactMaterial(new CANNON.ContactMaterial(ballMat, groundMat, {
+    friction: 0.4, restitution: 0.55,
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(ballMat, wallMat, {
+    friction: 0.3, restitution: 0.5,
+  }));
+
+  return { ballMat, groundMat, wallMat };
+}
+
+function buildArena() {
+  const groundGeo = new THREE.PlaneGeometry(30, 40);
+  groundGeo.rotateX(-Math.PI / 2);
+  const groundMat = new THREE.MeshStandardMaterial({
+    color: 0x2a2a3a, roughness: 0.9, metalness: 0.0,
+  });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.receiveShadow = true;
+  ground.position.set(0, -0.01, 4);
+  scene.add(ground);
+
+  const gridHelper = new THREE.GridHelper(30, 30, 0x444466, 0x333355);
+  gridHelper.position.set(0, 0.001, 4);
+  scene.add(gridHelper);
+
+  // Robot Operation Zone
+  const zoneGeo = new THREE.PlaneGeometry(4, 5);
+  zoneGeo.rotateX(-Math.PI / 2);
+  const zoneMat = new THREE.MeshStandardMaterial({
+    color: 0x1a3a2a, transparent: true, opacity: 0.25,
+    roughness: 0.8, metalness: 0.0,
+  });
+  const zone = new THREE.Mesh(zoneGeo, zoneMat);
+  zone.position.set(0, 0.002, 2.5);
+  zone.receiveShadow = true;
+  scene.add(zone);
+
+  // Zone border
+  const borderMat = new THREE.LineBasicMaterial({ color: 0x44ff88, transparent: true, opacity: 0.5 });
+  const pts = [
+    [-2, 0], [2, 0], [2, 5], [-2, 5], [-2, 0]
+  ].map(([x, z]) => new THREE.Vector3(x, 0.005, z));
+  const borderGeo = new THREE.BufferGeometry().setFromPoints(pts);
+  const border = new THREE.Line(borderGeo, borderMat);
+  scene.add(border);
+
+  // Zone label
+  const canvas = document.createElement('canvas');
+  canvas.width = 256; canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, 256, 64);
+  ctx.fillStyle = '#44ff88';
+  ctx.font = 'bold 28px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('ROBOT ZONE', 128, 32);
+  const labelTex = new THREE.CanvasTexture(canvas);
+  const labelMat = new THREE.SpriteMaterial({ map: labelTex, transparent: true, opacity: 0.7 });
+  const label = new THREE.Sprite(labelMat);
+  label.position.set(0, 0.05, 2.5);
+  label.scale.set(2.5, 0.625, 1);
+  scene.add(label);
+
+  // Distance marker at 2.5m
+  const markerMat = new THREE.LineBasicMaterial({ color: 0xff8844, transparent: true, opacity: 0.3 });
+  const markerPts = [
+    new THREE.Vector3(-1.5, 0.003, 5),
+    new THREE.Vector3(1.5, 0.003, 5),
+  ];
+  const markerGeo = new THREE.BufferGeometry().setFromPoints(markerPts);
+  const marker = new THREE.Line(markerGeo, markerMat);
+  scene.add(marker);
+
+  // Floor dimension labels
+  function makeLabel(text, x, z, color, size) {
+    const c = document.createElement('canvas');
+    c.width = 128; c.height = 48;
+    const cx = c.getContext('2d');
+    cx.fillStyle = 'rgba(0,0,0,0.6)';
+    cx.fillRect(0, 0, 128, 48);
+    cx.fillStyle = color || '#888';
+    cx.font = 'bold 22px monospace';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(text, 64, 26);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const spr = new THREE.Sprite(mat);
+    spr.position.set(x, 0.03, z);
+    spr.scale.set(size || 0.6, (size || 0.6) * 0.375, 1);
+    scene.add(spr);
+  }
+  // Z-axis distance markers (meters from origin along launch direction)
+  for (let z = 0; z <= 8; z++) {
+    makeLabel(`${z}m`, -2.3, z, z === 7 ? '#ff8844' : '#666');
+  }
+  makeLabel('BOARD', -2.3, 7.5, '#ff8844');
+  // X-axis markers at board line
+  for (let x = -1.5; x <= 1.5; x += 0.5) {
+    makeLabel(x.toFixed(1), x, 7.8, '#666', 0.4);
+  }
+}
+
+function buildFieldBarriers() {
+  const HW = 2, D = 11, HC = 4, HWd = 0.5, T = 0.12;
+  // Robot zone: z=0–5, Target zone: z=5–11
+  // All barriers at field edges: x=±2, z=0, z=11
+
+  const woodMat = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.9 });
+  const canvasMat = new THREE.MeshPhysicalMaterial({
+    color: 0x88ddff, transparent: true, opacity: 0.12,
+    roughness: 0.1, side: THREE.DoubleSide, depthWrite: false,
+  });
+  const trussMat = new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.6, metalness: 0.3 });
+
+  function addBarrier(w, h, d, px, py, pz, mat, isCanvas) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    mesh.position.set(px, py, pz);
+    scene.add(mesh);
+    const body = new CANNON.Body({ mass: 0, material: wallMat });
+    body.addShape(new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)));
+    body.position.set(px, py, pz);
+    world.addBody(body);
+  }
+
+  // --- 1. Wood lower walls (Robot Zone only, z=0–5) ---
+  addBarrier(T, HWd, 5, -HW, HWd/2, 2.5, woodMat);   // left
+  addBarrier(T, HWd, 5,  HW, HWd/2, 2.5, woodMat);   // right
+  addBarrier(4, HWd, T, 0, HWd/2, -T/2, woodMat);      // rear at z=0
+  addBarrier(4, HWd, T, 0, HWd/2, 5, woodMat);         // mid at z=5 (zone boundary)
+
+  // --- 2. Canvas walls (full height, full field) ---
+  addBarrier(T, HC, D, -HW, HC/2, D/2, canvasMat, true);    // left
+  addBarrier(T, HC, D,  HW, HC/2, D/2, canvasMat, true);    // right
+  addBarrier(4, HC, T, 0, HWd + HC/2, -T/2, canvasMat, true);  // rear (above wood)
+  addBarrier(4, HC, T, 0, HC/2, D + T/2, canvasMat, true);  // front at z=11
+  addBarrier(4, T, D, 0, HC, D/2, canvasMat, true);         // ceiling at y=4
+
+  // --- 3. Truss pillars at 4 corners ---
+  const pillarH = HC, pillarW = 0.25;
+  const corners = [
+    [-HW, 0, 0], [HW, 0, 0], [-HW, 0, D], [HW, 0, D],
+  ];
+  for (const [cx, cy, cz] of corners) {
+    const pMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(pillarW, pillarH, pillarW), trussMat
+    );
+    pMesh.position.set(cx, pillarH/2, cz);
+    scene.add(pMesh);
+    const pBody = new CANNON.Body({ mass: 0, material: wallMat });
+    pBody.addShape(new CANNON.Box(new CANNON.Vec3(pillarW/2, pillarH/2, pillarW/2)));
+    pBody.position.set(cx, pillarH/2, cz);
+    world.addBody(pBody);
+  }
+}
+
+function buildTargetBoard() {
+  boardGroup = new THREE.Group();
+  boardGroup.position.set(0, 1.7, 7.5);
+  // Vertical board (no rotation)
+  scene.add(boardGroup);
+
+  targetCircles = [];
+  hitTargets = [];
+  targetIdCounter = 0;
+
+  // Target positions — 3.0m × 3.4m board, origin at bottom-center on floor
+  const stdRadius = 0.2;
+  const bonusRadius = 0.1;
+  const positions = [];
+  // Local Y: worldY - 1.7 (board center Y)
+  const stdY = [-0.3, 0.3, 0.9];    // world: 1.4, 2.0, 2.6
+  const bonusY = [1.45];            // world: 3.15
+  const cols = [-0.9, 0, 0.9];
+
+  for (let y of stdY) {
+    for (let x of cols) {
+      positions.push({ id: `t${targetIdCounter++}`, x, y, r: stdRadius, type: 'standard', hit: false });
+    }
+  }
+  for (let y of bonusY) {
+    for (let x of cols) {
+      positions.push({ id: `t${targetIdCounter++}`, x, y, r: bonusRadius, type: 'bonus', hit: false });
+    }
+  }
+
+  // Board shape: 3.0w × 3.4h
+  const boardShape = new THREE.Shape();
+  boardShape.moveTo(-1.5, -1.7);
+  boardShape.lineTo(1.5, -1.7);
+  boardShape.lineTo(1.5, 1.7);
+  boardShape.lineTo(-1.5, 1.7);
+  boardShape.lineTo(-1.5, -1.7);
+
+  for (const p of positions) {
+    const hole = new THREE.Path();
+    const r = p.r;
+    const segs = 32;
+    for (let i = 0; i <= segs; i++) {
+      const theta = (i / segs) * Math.PI * 2;
+      const hx = p.x + r * Math.cos(theta);
+      const hy = p.y + r * Math.sin(theta);
+      if (i === 0) hole.moveTo(hx, hy);
+      else hole.lineTo(hx, hy);
+    }
+    boardShape.holes.push(hole);
+  }
+
+  const boardMat = new THREE.MeshStandardMaterial({
+    color: 0x2a2a4a, roughness: 0.6, metalness: 0.2,
+    side: THREE.DoubleSide,
+  });
+  const boardGeo = new THREE.ShapeGeometry(boardShape);
+  const board = new THREE.Mesh(boardGeo, boardMat);
+  board.position.z = -0.01;
+  boardGroup.add(board);
+
+  // Edge border
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0x6666aa });
+  const edgePts = [
+    [-1.5, -1.7, 0], [1.5, -1.7, 0], [1.5, 1.7, 0], [-1.5, 1.7, 0], [-1.5, -1.7, 0]
+  ].map(([x, y, z]) => new THREE.Vector3(x, y, z));
+  const edgeGeo = new THREE.BufferGeometry().setFromPoints(edgePts);
+  boardGroup.add(new THREE.Line(edgeGeo, edgeMat));
+
+  // Frame beams
+  const beamMat = new THREE.MeshStandardMaterial({ color: 0x555577, roughness: 0.7 });
+  boardGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.06, 3.4, 0.06), beamMat).translateX(-1.47).translateZ(0.05));
+  boardGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.06, 3.4, 0.06), beamMat).translateX(1.47).translateZ(0.05));
+  for (let y of [-0.52, 0.08, 0.68, 1.33]) {
+    boardGroup.add(new THREE.Mesh(new THREE.BoxGeometry(3.0, 0.04, 0.04), beamMat).translateY(y).translateZ(0.05));
+  }
+
+  // Target circle rings
+  const circleMatOn = new THREE.MeshStandardMaterial({
+    color: 0x44ff88, emissive: 0x22ff44, emissiveIntensity: 0.15,
+    side: THREE.DoubleSide, transparent: true, opacity: 0.8,
+  });
+  const circleMatOff = new THREE.MeshStandardMaterial({
+    color: 0x334455, emissive: 0x000000, emissiveIntensity: 0,
+    side: THREE.DoubleSide, transparent: true, opacity: 0.4,
+  });
+  const hitMat = new THREE.MeshStandardMaterial({
+    color: 0xff3333, emissive: 0xff0000, emissiveIntensity: 0.8,
+    side: THREE.DoubleSide, transparent: true, opacity: 0.95,
+  });
+
+  for (const p of positions) {
+    const mat = p.type === 'bonus' ? circleMatOn.clone() : circleMatOff.clone();
+    const g = new THREE.RingGeometry(p.r * 0.7, p.r * 1.05, 24);
+    const m = new THREE.Mesh(g, mat);
+    m.position.set(p.x, p.y, 0.001);
+    boardGroup.add(m);
+    targetCircles.push({ mesh: m, data: p, hitMat: hitMat.clone(), origMat: mat, boardGroup });
+  }
+
+  // Frame-shaped physics — full board with circular holes (vertical board)
+  // Uses overlapping strips to block all gaps between and around the 12 hole circles
+  const boardFrame = new CANNON.Body({ mass: 0, material: wallMat });
+  const BZ = 0.08;
+  const BH = 1.7;
+  const BW = 1.48;
+  const holes = [];
+  for (const y of stdY) for (const x of cols) holes.push({ x, y, r: 0.2 });
+  for (const y of bonusY) for (const x of cols) holes.push({ x, y, r: 0.1 });
+  // Vertical strips — block gaps between columns + outer edge gaps (full height)
+  const colGaps = [];
+  colGaps.push({ x: -1.3, w: 0.4 });
+  colGaps.push({ x: -0.45, w: 0.5 });
+  colGaps.push({ x: 0.45, w: 0.5 });
+  colGaps.push({ x: 1.3, w: 0.4 });
+  for (const g of colGaps) {
+    boardFrame.addShape(new CANNON.Box(new CANNON.Vec3(g.w / 2, BH, BZ)), new CANNON.Vec3(g.x, 0, 0));
+  }
+  // Horizontal strips — block gaps between rows (full width)
+  const rowGaps = [];
+  rowGaps.push({ y: -1.1, h: 1.2 });
+  rowGaps.push({ y: 0, h: 0.2 });
+  rowGaps.push({ y: 0.6, h: 0.2 });
+  rowGaps.push({ y: 1.225, h: 0.25 });
+  rowGaps.push({ y: 1.625, h: 0.15 });
+  for (const g of rowGaps) {
+    boardFrame.addShape(new CANNON.Box(new CANNON.Vec3(BW, g.h / 2, BZ)), new CANNON.Vec3(0, g.y, 0));
+  }
+  // Corner-filler boxes — block the rectilinear corners outside each hole circle
+  const cornerSize = 0.07;
+  for (const h of holes) {
+    const d = h.r + cornerSize * 0.3;
+    for (let sx of [-1, 1]) {
+      for (let sy of [-1, 1]) {
+        boardFrame.addShape(
+          new CANNON.Box(new CANNON.Vec3(cornerSize / 2, cornerSize / 2, BZ)),
+          new CANNON.Vec3(h.x + sx * d, h.y + sy * d, 0)
+        );
+      }
+    }
+  }
+  boardFrame.position.set(0, 1.7, 7.58);
+  world.addBody(boardFrame);
+
+  // Catching Tubes behind each hole — longer, thicker walls, with end cap
+  const TUBE_LEN = 0.5;
+  const TUBE_THICK = 0.06;
+  const TUBE_ANGLE = 5 * RAD;
+  const tubeQuat = new CANNON.Quaternion();
+  tubeQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), TUBE_ANGLE);
+  for (const p of positions) {
+    const rTube = p.r * 0.85;
+    const hw = rTube;
+    const hh = rTube;
+    const wx = p.x;
+    const wy = p.y + 1.7;
+    const dY = -TUBE_LEN * Math.sin(TUBE_ANGLE);
+    const dZ = TUBE_LEN * Math.cos(TUBE_ANGLE);
+    const tubeBody = new CANNON.Body({ mass: 0, material: wallMat });
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, TUBE_THICK, TUBE_LEN)), new CANNON.Vec3(0, hh, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, TUBE_THICK, TUBE_LEN)), new CANNON.Vec3(0, -hh, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(TUBE_THICK, hh, TUBE_LEN)), new CANNON.Vec3(-hw, 0, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(TUBE_THICK, hh, TUBE_LEN)), new CANNON.Vec3(hw, 0, 0));
+    // End cap
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, hh, TUBE_THICK)), new CANNON.Vec3(0, 0, 0));
+    tubeBody.position.set(wx, wy + dY, 7.5 + dZ);
+    tubeBody.quaternion.copy(tubeQuat);
+    world.addBody(tubeBody);
+
+    // Visual tube (semi-transparent box with wireframe edges)
+    const tubeVisMat = new THREE.MeshPhysicalMaterial({
+      color: 0x88ddff, transparent: true, opacity: 0.15, roughness: 0.3, side: THREE.DoubleSide, depthWrite: false,
+    });
+    const tubeVis = new THREE.Mesh(new THREE.BoxGeometry(hw * 2, hh * 2, TUBE_LEN), tubeVisMat);
+    tubeVis.position.copy(tubeBody.position);
+    tubeVis.quaternion.copy(tubeBody.quaternion);
+    scene.add(tubeVis);
+    // Wireframe edge overlay
+    const edgeMat = new THREE.LineBasicMaterial({ color: 0x88ddff, transparent: true, opacity: 0.3 });
+    const edge = new THREE.LineSegments(new THREE.EdgesGeometry(tubeVis.geometry), edgeMat);
+    edge.position.copy(tubeVis.position);
+    edge.quaternion.copy(tubeVis.quaternion);
+    scene.add(edge);
+  }
+
+  // Y-axis labels on left side of board
+  function makeBoardLabel(text, y, color) {
+    const c = document.createElement('canvas');
+    c.width = 80; c.height = 36;
+    const cx = c.getContext('2d');
+    cx.fillStyle = 'rgba(0,0,0,0.5)';
+    cx.fillRect(0, 0, 80, 36);
+    cx.fillStyle = color || '#aaa';
+    cx.font = 'bold 16px monospace';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(text, 40, 18);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const spr = new THREE.Sprite(mat);
+    spr.position.set(-1.65, y, 7.5);
+    spr.scale.set(0.35, 0.16, 1);
+    scene.add(spr);
+  }
+  for (let y = 0; y <= 3.4; y += 0.5) {
+    const isHoleRow = [1.4, 2.0, 2.6, 3.15].some(h => Math.abs(h - y) < 0.01);
+    makeBoardLabel(y.toFixed(1), y, isHoleRow ? '#ff8844' : '#888');
+  }
+  makeBoardLabel('3.15★', 3.15, '#ffaa44');
+  makeBoardLabel('3.4', 3.4, '#888');
+}
+
+function buildTrebuchet() {
+  const h = config.heading * RAD;
+  const px = config.posX;
+  const pz = config.posZ;
+  const ph = config.pivotHeight;
+  const ll = config.leverLengthLoad;
+  const lc = config.leverLengthCW;
+
+  if (trebuchetGroup) {
+    scene.remove(trebuchetGroup);
+    trebuchetGroup = null;
+  }
+  trebuchetGroup = new THREE.Group();
+  scene.add(trebuchetGroup);
+
+  // Remove old physics
+  if (armBody) {
+    world.removeBody(armBody);
+    armBody = null;
+  }
+  if (mountBody) {
+    world.removeBody(mountBody);
+    mountBody = null;
+  }
+  if (ballBody) {
+    world.removeBody(ballBody);
+    ballBody = null;
+  }
+  if (hingeConstraint) { world.removeConstraint(hingeConstraint); hingeConstraint = null; }
+
+  if (ballMesh && ballMesh.parent) {
+    ballMesh.parent.remove(ballMesh);
+  }
+
+  // Bounding box wireframe (0.5 × 0.5 × 0.6m)
+  if (boundingBox) { scene.remove(boundingBox); boundingBox = null; }
+  boundingBox = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(0.5, 0.6, 0.5)),
+    new THREE.LineBasicMaterial({ color: 0x44ff44, transparent: true, opacity: 0.5 })
+  );
+  boundingBox.position.set(px, 0.3, pz);
+  scene.add(boundingBox);
+
+  const dirX = Math.sin(h);
+  const dirZ = Math.cos(h);
+
+  // Base pivot world position (from baseGroup local offset + heading rotation)
+  const cosH = Math.cos(h);
+  const sinH = Math.sin(h);
+  const pivotX = px + config.basePivotX * cosH + config.basePivotZ * sinH;
+  const pivotY = config.basePivotY;
+  const pivotZ = pz - config.basePivotX * sinH + config.basePivotZ * cosH;
+
+  // ---- Physics bodies ----
+
+  // Mount (static, at fulcrum)
+  mountBody = new CANNON.Body({ mass: 0 });
+  mountBody.position.set(pivotX, pivotY, pivotZ);
+  const headingQuat = new CANNON.Quaternion();
+  headingQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
+  mountBody.quaternion.copy(headingQuat);
+  world.addBody(mountBody);
+
+  // Arm body (motor-driven, no separate counterweight)
+  armBody = new CANNON.Body({ mass: config.armMass });
+  armBody.addShape(new CANNON.Box(new CANNON.Vec3(0.025, 0.025, (ll + lc) / 2)));
+  armBody.position.set(pivotX, pivotY, pivotZ);
+
+  const tiltQuat = new CANNON.Quaternion();
+  tiltQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  armBody.quaternion = tiltQuat.mult(headingQuat);
+  armBody.sleepSpeedLimit = 0.1;
+  armBody.sleepTimeLimit = 0.5;
+  world.addBody(armBody);
+
+  // Hinge: motor holds arm cocked until fire, then drives forward
+  hingeConstraint = new CANNON.HingeConstraint(armBody, mountBody, {
+    pivotA: new CANNON.Vec3(0, 0, 0),
+    pivotB: new CANNON.Vec3(0, 0, 0),
+    axisA: new CANNON.Vec3(1, 0, 0),
+    axisB: new CANNON.Vec3(1, 0, 0),
+    motorEnabled: true,
+    motorSpeed: 0,
+    motorMaxForce: 10000,
+  });
+  world.addConstraint(hingeConstraint);
+
+  // Ball body — kinematic, follows arm tip + ball offset (catapult style)
+  const ballRadius = 0.035;
+  ballBody = new CANNON.Body({ mass: 0 });
+  ballBody.type = CANNON.Body.KINEMATIC;
+  ballBody.addShape(new CANNON.Sphere(ballRadius));
+  ballBody.ccdSpeedThreshold = 3;
+  ballBody.ccdRadius = ballRadius * 0.8;
+  const armTipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -ll + config.ballOffsetZ);
+  const armTipWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(armTipLocal, armTipWorld);
+  armTipWorld.vadd(armBody.position, armTipWorld);
+  ballBody.position.copy(armTipWorld);
+  world.addBody(ballBody);
+
+  // ---- Three.js visuals ----
+
+  // Group for base parts that rotate with heading
+  baseGroup = new THREE.Group();
+  baseGroup.position.set(px, 0, pz);
+  baseGroup.rotation.y = h;
+  trebuchetGroup.add(baseGroup);
+
+  // Arm wrapper group — synced to physics body; mesh offset within it for CAD calibration
+  armGroup = new THREE.Group();
+  trebuchetGroup.add(armGroup);
+
+  if (glbBase && glbArm) {
+    // Use loaded CAD models
+    const baseClone = glbBase.clone(true);
+    baseClone.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    baseGroup.add(baseClone);
+
+    armMesh = glbArm.clone(true);
+    armMesh.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    armMesh.castShadow = true;
+    armMesh.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+    armGroup.add(armMesh);
+
+  } else {
+    // Fallback: procedurally generated geometry
+    // Base platform
+    const baseMat = new THREE.MeshStandardMaterial({ color: 0x555566, roughness: 0.7, metalness: 0.3 });
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.08, 0.6), baseMat);
+    base.position.set(0, 0.04, 0);
+    base.castShadow = true;
+    baseGroup.add(base);
+
+    // Wheels
+    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+    for (let wz of [-0.25, 0.25]) {
+      for (let wx of [-0.28, 0.28]) {
+        const w = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.04, 12), wheelMat);
+        w.rotation.x = Math.PI / 2;
+        w.position.set(wx, 0.04, wz);
+        baseGroup.add(w);
+      }
+    }
+
+    // Upright support (two posts on sides of base)
+    const postMat = new THREE.MeshStandardMaterial({ color: 0x667788, roughness: 0.5, metalness: 0.4 });
+    for (let side of [-1, 1]) {
+      const post = new THREE.Mesh(new THREE.BoxGeometry(0.04, ph, 0.04), postMat);
+      post.position.set(side * 0.08, ph / 2, 0);
+      baseGroup.add(post);
+    }
+
+    // Lever arm (geometry offset so load arm extends in -Z, CW in +Z)
+    const armGeo = new THREE.BoxGeometry(0.03, 0.03, ll + lc);
+    armGeo.translate(0, 0, (lc - ll) / 2);
+    armMesh = new THREE.Mesh(
+      armGeo,
+      new THREE.MeshStandardMaterial({ color: 0x88aacc, roughness: 0.4, metalness: 0.5 })
+    );
+    armMesh.castShadow = true;
+    armMesh.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+    armGroup.add(armMesh);
+
+  }
+
+  // Pivot point visual (orange = physics fulcrum)
+  pivotDotOrange = new THREE.Mesh(
+    new THREE.SphereGeometry(0.03, 8, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff8844 })
+  );
+  pivotDotOrange.position.set(pivotX, pivotY, pivotZ);
+  trebuchetGroup.add(pivotDotOrange);
+
+  // Blue dot = CAD mesh local origin (child of armGroup, offset = meshOffset)
+  const calDotMat = new THREE.MeshBasicMaterial({ color: 0x44aaff });
+  pivotDot = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), calDotMat);
+  pivotDot.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+  armGroup.add(pivotDot);
+
+  // Green dot = ball attachment point on arm tip (child of armGroup)
+  const ballDotMat = new THREE.MeshBasicMaterial({ color: 0x44ff44 });
+  pivotDotGreen = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), ballDotMat);
+  pivotDotGreen.position.set(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+  armGroup.add(pivotDotGreen);
+
+  if (transformCtrl && transformCtrl.visible) {
+    const tgt = gizmoTarget === 'Base Pivot' ? pivotDotOrange : gizmoTarget === 'Ball Offset' ? pivotDotGreen : pivotDot;
+    if (tgt) transformCtrl.attach(tgt);
+  }
+
+  // Ball visual
+  ballMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(ballRadius, 16, 16),
+    new THREE.MeshStandardMaterial({ color: 0xeeeedd, roughness: 0.8, metalness: 0.0 })
+  );
+  ballMesh.castShadow = true;
+  trebuchetGroup.add(ballMesh);
+
+  // Heading arrow indicator
+  const arrowEnd = new THREE.Vector3(px + 0.3 * dirX, 0.1, pz + 0.3 * dirZ);
+  const arrowPts = [
+    new THREE.Vector3(px, 0.1, pz),
+    arrowEnd,
+  ];
+  const arrowGeo = new THREE.BufferGeometry().setFromPoints(arrowPts);
+  const arrowMat = new THREE.LineBasicMaterial({ color: 0x44aaff, transparent: true, opacity: 0.4 });
+  const arrowLine = new THREE.Line(arrowGeo, arrowMat);
+  trebuchetGroup.add(arrowLine);
+}
+
+function buildTrail() {
+  if (trailLine) {
+    scene.remove(trailLine);
+    trailLine.geometry.dispose();
+  }
+  trailBuffer = new Float32Array(MAX_TRAIL * 3);
+  const trailGeo = new THREE.BufferGeometry();
+  trailGeo.setAttribute('position', new THREE.BufferAttribute(trailBuffer, 3));
+  trailGeo.setDrawRange(0, 0);
+  const trailMat = new THREE.LineBasicMaterial({
+    color: 0x66ddff, transparent: true, opacity: 0.7,
+  });
+  trailLine = new THREE.Line(trailGeo, trailMat);
+  scene.add(trailLine);
+}
+
+function fireTrebuchet() {
+  if (fired) return;
+  const totalMass = config.armMass + config.baseMass;
+  if (totalMass > 30) {
+    setStatus(`Mass limit exceeded: ${totalMass.toFixed(1)}kg > 30kg`);
+    log(`⚠ Mass ${totalMass.toFixed(1)}kg exceeds 30kg limit`);
+    return;
+  }
+  fired = true;
+  released = false;
+  landed = false;
+  hasHit = false;
+  firedTime = clock.elapsedTime;
+  firedWallTime = Date.now();
+  trajectoryPoints = [];
+  _boardCrossY = null;
+  _boardCrossVx = null; _boardCrossVy = null; _boardCrossVz = null;
+  _lastHitProximity = 0; _lastHitQuality = '';
+
+  world.gravity.set(0, -9.82, 0);
+
+  if (armBody) {
+    armBody.wakeUp();
+    armBody.sleepSpeedLimit = -1;
+  }
+  // Engage motor to drive arm forward
+  if (hingeConstraint) {
+    hingeConstraint.enableMotor();
+    hingeConstraint.setMotorSpeed(30);
+    hingeConstraint.motorMaxForce = config.motorTorque;
+  }
+  if (ballBody) ballBody.wakeUp();
+
+  setStatus('Fired! Ball in flight...');
+  log('Trebuchet fired.');
+}
+
+function resetSim(keepLog = false) {
+  fired = false;
+  released = false;
+  landed = false;
+  hasHit = false;
+  firedTime = 0;
+  firedWallTime = 0;
+  trajectoryPoints = [];
+  hitTargets = [];
+  score = 0;
+  _stallFrames = 0;
+  updateScoreDisplay();
+
+  world.gravity.set(0, 0, 0);
+
+  // Reset target colors
+  for (const tc of targetCircles) {
+    tc.mesh.material.color.copy(tc.origMat.color);
+    tc.mesh.material.emissive.setHex(0x000000);
+    tc.mesh.material.emissiveIntensity = 0;
+    tc.data.hit = false;
+  }
+
+  buildTrebuchet();
+  buildTrail();
+
+  if (!keepLog) {
+    logContainer.innerHTML = '';
+    setStatus('Reset. Adjust parameters and press FIRE.');
+    log('Simulation reset.');
+  }
+}
+
+function updateCatapultBall() {
+  if (!armBody || !ballBody) return;
+  const tipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+  const tipWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(tipLocal, tipWorld);
+  tipWorld.vadd(armBody.position, tipWorld);
+  ballBody.position.copy(tipWorld);
+}
+
+function checkRelease() {
+  if (!fired || released || !armBody) return;
+
+  const h = config.heading * RAD;
+  const hingeAxis = new CANNON.Vec3(Math.cos(h), 0, -Math.sin(h));
+
+  // Initial load direction in world space (local -Z with initial tilt + heading)
+  const initQuat = new CANNON.Quaternion();
+  initQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  const headQuat = new CANNON.Quaternion();
+  headQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
+  const fullInit = initQuat.mult(headQuat);
+  const localDir = new CANNON.Vec3(0, 0, -1);
+  const initWorld = new CANNON.Vec3();
+  fullInit.vmult(localDir, initWorld);
+
+  // Current load direction in world space
+  const curWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(localDir, curWorld);
+
+  // Project both onto swing plane
+  function proj(v) {
+    const d = v.dot(hingeAxis);
+    return new CANNON.Vec3(v.x - d * hingeAxis.x, v.y - d * hingeAxis.y, v.z - d * hingeAxis.z);
+  }
+  const initP = proj(initWorld).unit();
+  const curP = proj(curWorld).unit();
+
+  // Signed rotation angle from initial position around hinge axis
+  const cross = new CANNON.Vec3();
+  initP.cross(curP, cross);
+  const angle = Math.atan2(cross.dot(hingeAxis), initP.dot(curP)) * (180 / Math.PI);
+
+  if (angle >= config.releaseAngle) {
+    released = true;
+    _stallFrames = 0;
+    // Kill motor so arm doesn't keep spinning
+    if (hingeConstraint) hingeConstraint.disableMotor();
+    // Catapult release: transfer arm tip velocity to ball
+    if (ballBody && armBody) {
+      const tipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+      const rWorld = new CANNON.Vec3();
+      armBody.vectorToWorldFrame(tipLocal, rWorld);
+      const tipVel = new CANNON.Vec3();
+      armBody.angularVelocity.cross(rWorld, tipVel);
+      tipVel.vadd(armBody.velocity, tipVel);
+      ballBody.velocity.copy(tipVel);
+      ballBody.type = CANNON.Body.DYNAMIC;
+      ballBody.mass = 0.03;
+      ballBody.updateMassProperties();
+      ballBody.wakeUp();
+    }
+    log(`Ball released at angle: ${angle.toFixed(1)}°`);
+    setStatus('Ball released!');
+  }
+}
+
+// Evaluate hole hit with deflection model
+function evaluateHoleHit(dist, dx, dy, rHole, vx, vy, vz) {
+  const R_BALL = 0.035;
+  if (dist <= rHole - R_BALL) {
+    const proximity = dist > 0 ? 1 - (dist / (rHole - R_BALL)) : 1;
+    return { hit: true, proximity, quality: 'clean', dist };
+  }
+  if (dist < rHole + R_BALL) {
+    if (vx != null && vy != null && vz != null) {
+      const nx = dx / dist, ny = dy / dist;
+      const vRadial = vx * nx + vy * ny;
+      const vTangMag = Math.abs(vx * (-ny) + vy * nx);
+      const vThrough = Math.abs(vz);
+      const restitution = 0.4;
+      const vRadialAfter = -restitution * vRadial;
+      const enters = vRadialAfter < 0 || (vTangMag > Math.abs(vRadialAfter) * 1.5 && vThrough > 1.0);
+      if (enters) {
+        const band = 2 * R_BALL;
+        const overlap = dist - (rHole - R_BALL);
+        const edgeProx = Math.max(0, 1 - overlap / band);
+        return { hit: true, proximity: edgeProx * 0.5, quality: 'deflect', dist };
+      }
+      return { hit: false, proximity: 0, quality: 'bounce', dist };
+    }
+    // No velocity data — geometric fallback
+    return { hit: dist < rHole - R_BALL * 0.5, proximity: 0, quality: 'uncertain', dist };
+  }
+  return { hit: false, proximity: 0, quality: 'miss', dist };
+}
+
+function checkTargetHit() {
+  if (!released || !ballBody || hasHit) return;
+
+  const ballPos = ballBody.position;
+  const bv = new THREE.Vector3(ballPos.x, ballPos.y, ballPos.z);
+  const localPos = new THREE.Vector3();
+  boardGroup.worldToLocal(localPos.copy(bv));
+
+  if (Math.abs(localPos.z) > 0.08) return;
+
+  for (const tc of targetCircles) {
+    if (tc.data.hit) continue;
+    const dx = localPos.x - tc.data.x;
+    const dy = localPos.y - tc.data.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const result = evaluateHoleHit(dist, dx, dy, tc.data.r, _boardCrossVx, _boardCrossVy, _boardCrossVz);
+
+    if (result.hit) {
+      tc.data.hit = true;
+      _lastHitProximity = result.proximity;
+      _lastHitQuality = result.quality;
+
+      if (result.quality === 'clean') {
+        tc.mesh.material.color.setHex(0x44ff88);
+        tc.mesh.material.emissive.setHex(0x22ff44);
+        tc.mesh.material.emissiveIntensity = 0.6;
+      } else {
+        tc.mesh.material.color.setHex(0xffaa22);
+        tc.mesh.material.emissive.setHex(0xff8800);
+        tc.mesh.material.emissiveIntensity = 0.8;
+      }
+      hitTargets.push(tc.data);
+      hasHit = true;
+      const pts = TARGET_POINTS[tc.data.type] || 1;
+      score += pts;
+      updateScoreDisplay();
+      const label = tc.data.type === 'bonus' ? 'BONUS' : 'Standard';
+      const proxStr = result.proximity > 0 ? ` (proximity: ${(result.proximity * 100).toFixed(0)}%)` : '';
+      log(`HIT ${label} target! [${result.quality}] +${pts} pts${proxStr}`, true);
+      setStatus(`Target hit! ${label} target! (Total: ${score} pts)`);
+    } else if (result.quality === 'bounce') {
+      // Flash near-miss indicator on the ring
+      tc.mesh.material.color.setHex(0xff6622);
+      tc.mesh.material.emissive.setHex(0xff4400);
+      tc.mesh.material.emissiveIntensity = 0.3;
+      setTimeout(() => {
+        tc.mesh.material.color.copy(tc.origMat.color);
+        tc.mesh.material.emissive.copy(tc.origMat.emissive);
+        tc.mesh.material.emissiveIntensity = tc.origMat.emissiveIntensity;
+      }, 200);
+    }
+  }
+}
+
+function checkLanding() {
+  if (!released || landed || !ballBody) return;
+
+  const pos = ballBody.position;
+  const wallElapsed = Date.now() - firedWallTime;
+  const vel = ballBody.velocity;
+  const settled = pos.y < 0.12 && vel.length() < 0.4 && wallElapsed > 1000;
+  if (pos.y < -0.5 || pos.y > 15 || Math.abs(pos.x) > 15 || pos.z > 25 || pos.z < -5 || wallElapsed > 5000 || settled) {
+    landed = true;
+    setStatus(`Ball landed. Final position: X=${pos.x.toFixed(3)}m, Z=${pos.z.toFixed(3)}m`);
+    log(`Landing: (${pos.x.toFixed(3)}, ${pos.z.toFixed(3)})`);
+
+    if (!hasHit) {
+      log('No target hit.');
+    }
+
+    // Validation: record trial result
+    if (validator.running) {
+      VrecordTrial(hasHit, { x: pos.x, z: pos.z });
+    }
+  }
+}
+
+// ===== Validation System =====
+
+function rand(min, max) { return min + Math.random() * (max - min); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// Physics-based trajectory prediction (energy model)
+function launchVelocity(params) {
+  const g = 9.82, mp = 0.03, armM = config.armMass || 2;
+  const ll = params.leverLengthLoad, lc = params.leverLengthCW;
+  const totalLen = ll + lc;
+  const I = armM * totalLen * totalLen / 12 + mp * ll * ll;
+  const theta = params.releaseAngle * RAD;
+  const work = params.motorTorque * theta;
+  const omegaIdeal = Math.sqrt(2 * work / I);
+  const omega = Math.min(omegaIdeal, 30); // motor target speed cap
+  const v = omega * ll;
+  const launchRad = (135 - params.releaseAngle) * RAD;
+  return { v, launchRad, g };
+}
+
+function predictRange(params) {
+  const { v, launchRad, g } = launchVelocity(params);
+  const launchY = params.pivotHeight;
+  const vx = v * Math.cos(launchRad);
+  const vy = v * Math.sin(launchRad);
+  const disc = vy * vy + 2 * g * launchY;
+  if (disc < 0) return 0;
+  const t = (vy + Math.sqrt(disc)) / g;
+  return vx * t;
+}
+
+function predictHeight(params) {
+  const { v, launchRad, g } = launchVelocity(params);
+  const d = BOARD.centerZ - params.posZ;
+  if (d <= 0) return 0;
+  const cosR = Math.cos(launchRad);
+  if (cosR < 0.001) return 0;
+  const launchY = params.pivotHeight;
+  const y = launchY + d * Math.tan(launchRad) - g * d * d / (2 * v * v * cosR * cosR);
+  return y;
+}
+
+// Small trial-level noise
+function trialNoise(base) {
+  return {
+    posX: base.posX + (Math.random() - 0.5) * 0.04,
+    posZ: base.posZ + (Math.random() - 0.5) * 0.06,
+    heading: base.heading + (Math.random() - 0.5) * 1.0,
+    pivotHeight: base.pivotHeight,
+    motorTorque: base.motorTorque * (1 + (Math.random() - 0.5) * 0.02),
+    leverLengthLoad: base.leverLengthLoad,
+    leverLengthCW: base.leverLengthCW,
+    releaseAngle: base.releaseAngle + (Math.random() - 0.5) * 1.0,
+  };
+}
+
+function noisyTrial(base) {
+  const p = trialNoise(base);
+  for (const param of FIXED_PARAMS) p[param] = config[param];
+  Object.assign(config, p);
+  resetSim(true);
+  fireTrebuchet();
+}
+
+// Early fail detection — abort obviously bad launches mid-flight
+function earlyFailCheck() {
+  if (!released || landed || !ballBody) return false;
+  const pos = ballBody.position;
+  const vel = ballBody.velocity;
+  const dz = pos.z - config.posZ; // how far forward from trebuchet
+  
+  // Going backward after release
+  if (dz < -0.5 && vel.z < -0.5) return true;
+  // Hit ground before reaching target zone
+  if (pos.y < 0.08 && dz < 2.5) return true;
+  // Way off to one side
+  if (Math.abs(pos.x) > 5.0) return true;
+  // Overshot — flew past the board way above it (never coming back)
+  if (pos.z > 10 && vel.z > 0) return true;
+  // Falling fast and still short of the target
+  if (vel.y < -6 && dz < 3.0 && pos.y < 0.5) return true;
+  // Bounced off ceiling and coming back down before reaching target
+  if (pos.y > 3.5 && vel.y < -1 && dz < 4.0) return true;
+  // Stalled — ball released but never left the launch zone
+  if (dz < 0.3) {
+    const speed = Math.sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z);
+    if (speed < 0.8) {
+      _stallFrames++;
+      if (_stallFrames > 8) return true;
+    } else {
+      _stallFrames = Math.max(0, _stallFrames - 1);
+    }
+  } else {
+    _stallFrames = 0;
+  }
+  return false;
+}
+
+// ===== Validation Persistence (localStorage + CSV) =====
+
+function saveTraining() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+      sets: validator.sets,
+      results: validator.results,
+      totalTrials: validator.totalTrials,
+      targetOrder: validator.targetOrder,
+      validatedTargets: validator.validatedTargets,
+      failedTargets: validator.failedTargets,
+      validationLevel: validator.validationLevel,
+      levelTrials: validator.levelTrials,
+      validatedCounts: validator.validatedCounts,
+    }));
+  } catch (e) {
+    console.warn('localStorage quota exceeded for validation data');
+  }
+}
+
+function loadTraining() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return;
+  try {
+    const d = JSON.parse(raw);
+    if (d.sets) validator.sets = d.sets;
+    if (d.results) validator.results = d.results;
+    if (d.totalTrials) validator.totalTrials = d.totalTrials;
+    if (d.targetOrder) validator.targetOrder = d.targetOrder;
+    if (d.validatedTargets) validator.validatedTargets = d.validatedTargets;
+    if (d.failedTargets) validator.failedTargets = d.failedTargets;
+    if (d.validationLevel != null) validator.validationLevel = d.validationLevel;
+    if (d.levelTrials) validator.levelTrials = d.levelTrials;
+    if (d.validatedCounts) validator.validatedCounts = d.validatedCounts;
+  } catch (e) { /* ignore corrupt data */ }
+}
+
+function buildValidationCSV() {
+  const header = 'setIdx,posX,posZ,heading,pivotHeight,motorTorque,leverLengthLoad,leverLengthCW,releaseAngle,hits,total,accuracy,avgLandZ,stdLandZ,reliability,validatedLevel,targetValidated';
+  const rows = [];
+  let idx = 0;
+  for (const key in validator.results) {
+    const r = validator.results[key];
+    const s = computeStats(r);
+    // Check if this param set validated any target
+    let validatedInfo = '';
+    for (const vt of validator.validatedTargets) {
+      const pk = JSON.stringify(vt.params);
+      if (pk === key) {
+        validatedInfo = `${vt.level},${vt.targetId}`;
+        break;
+      }
+    }
+    rows.push(
+      `${idx},${r.params.posX.toFixed(4)},${r.params.posZ.toFixed(4)},${r.params.heading.toFixed(2)},` +
+      `${r.params.pivotHeight.toFixed(4)},${r.params.motorTorque.toFixed(2)},` +
+      `${r.params.leverLengthLoad.toFixed(4)},${r.params.leverLengthCW.toFixed(4)},` +
+      `${r.params.releaseAngle.toFixed(2)},` +
+      `${s.hits},${s.total},${s.acc.toFixed(2)},` +
+      `${s.avgZ != null ? s.avgZ.toFixed(4) : ''},${s.stdZ != null ? s.stdZ.toFixed(4) : ''},${s.reliability.toFixed(1)},` +
+      `${validatedInfo || ','}`
+    );
+    idx++;
+  }
+  return [header, ...rows].join('\n');
+}
+
+function sendCSV(csv, auto) {
+  fetch('/save-csv', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ csv, auto }),
+  }).then(r => r.json()).then(d => {
+    if (!auto) log(`CSV saved to server: ${d.filename}`);
+  }).catch((err) => {
+    if (auto) {
+      console.warn('Auto-save CSV failed — server not reachable. Open via http://localhost:8765', err.message);
+      return;
+    }
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `trebuchet_validation_${Date.now()}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+  });
+}
+
+function exportCSV() {
+  const csv = buildValidationCSV();
+  sendCSV(csv, false);
+}
+
+function importCSVHandler(files) {
+  if (!files.length) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const lines = e.target.result.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return;
+    const sets = [];
+    const isTrainingCSV = lines[0].toLowerCase().startsWith('gen,');
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(',');
+      if (cols.length < 10) continue;
+      if (isTrainingCSV) {
+        // Training CSV: gen,idx,trial,posX,posZ,heading,pivotHeight,motorTorque,leverLengthLoad,leverLengthCW,releaseAngle,hit,range,landX,landZ,targetId
+        const params = {
+          posX: parseFloat(cols[3]) || 0, posZ: parseFloat(cols[4]) || 2.5,
+          heading: parseFloat(cols[5]) || 0, pivotHeight: parseFloat(cols[6]) || 1.0,
+          motorTorque: parseFloat(cols[7]) || 50,
+          leverLengthLoad: parseFloat(cols[8]) || 1.0, leverLengthCW: parseFloat(cols[9]) || 0.5,
+          releaseAngle: parseFloat(cols[10]) || 95,
+        };
+        const hit = cols[12] === '1';
+        const key = JSON.stringify(params);
+        const existing = sets.find(s => JSON.stringify(s.params) === key);
+        if (existing) { existing.total++; if (hit) existing.hits++; }
+        else { sets.push({ params, hits: hit ? 1 : 0, total: 1 }); }
+      } else {
+        // Validation CSV: posX,posZ,heading,pivotHeight,motorTorque,leverLengthLoad,leverLengthCW,releaseAngle,label
+        sets.push({
+          params: {
+            posX: parseFloat(cols[0]) || 0, posZ: parseFloat(cols[1]) || 2.5,
+            heading: parseFloat(cols[2]) || 0, pivotHeight: parseFloat(cols[3]) || 1.0,
+            motorTorque: parseFloat(cols[4]) || 50,
+            leverLengthLoad: parseFloat(cols[5]) || 1.0, leverLengthCW: parseFloat(cols[6]) || 0.5,
+            releaseAngle: parseFloat(cols[7]) || 95,
+          },
+          hits: 0, total: 0,
+          label: cols[9] || `Imported ${sets.length + 1}`,
+        });
+      }
+    }
+    if (isTrainingCSV) {
+      // Sort by hit rate descending; use hit rate as label
+      sets.sort((a, b) => (b.hits / b.total) - (a.hits / a.total));
+    }
+    validator.sets = sets.map(s => ({ params: s.params, label: s.label || `acc${(s.hits / Math.max(s.total, 1) * 100).toFixed(0)}` }));
+    validator.results = {};
+    validator.currentTargetIdx = 0;
+    validator.currentSetIdx = 0;
+    validator.totalTrials = 0;
+    saveTraining();
+    log(`Imported ${sets.length} parameter sets from ${isTrainingCSV ? 'training' : 'validation'} CSV.`);
+    updateValidationUI();
+  };
+  reader.readAsText(files[0]);
+}
+
+// ===== End Persistence =====
+
+// ===== Diagnostics Chart =====
+
+const TARGET_DEFS = [];
+const TARGET_ROWS = 3, TARGET_COLS = 3;
+const TARGET_BOARD_WIDTH = 3.0, TARGET_BOARD_HEIGHT = 2.0;
+const TARGET_OFFSET_X = -1.0, TARGET_OFFSET_Y = 0.3;
+const TARGET_GAP_X = 1.2, TARGET_GAP_Y = 0.7;
+const TARGET_BOARD_Z = 7.5;
+for (let row = 0; row < TARGET_ROWS; row++) {
+  for (let col = 0; col < TARGET_COLS; col++) {
+    const isBonus = row === 0;
+    TARGET_DEFS.push({
+      x: TARGET_OFFSET_X + col * TARGET_GAP_X,
+      y: TARGET_OFFSET_Y + row * TARGET_GAP_Y,
+      r: isBonus ? 0.1 : 0.2,
+      bonus: isBonus,
+    });
+  }
+}
+
+let chartCanvas = null;
+let chartVisible = false;
+
+function showChart() {
+  if (!chartCanvas) {
+    chartCanvas = document.createElement('canvas');
+    chartCanvas.id = 'diag-chart';
+    chartCanvas.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:100;cursor:pointer;background:rgba(10,10,10,0.92);display:none';
+    document.body.appendChild(chartCanvas);
+    chartCanvas.addEventListener('click', hideChart);
+  }
+  chartVisible = true;
+  chartCanvas.style.display = 'block';
+  chartCanvas.width = window.innerWidth;
+  chartCanvas.height = window.innerHeight;
+  drawChart();
+}
+
+function hideChart() {
+  if (!chartCanvas) return;
+  chartVisible = false;
+  chartCanvas.style.display = 'none';
+}
+
+function drawChart() {
+  if (!chartCanvas || !chartVisible) return;
+  const c = chartCanvas.getContext('2d');
+  const W = chartCanvas.width, H = chartCanvas.height;
+
+  // Chart area (margins)
+  const ml = 80, mr = 40, mt = 60, mb = 50;
+  const cw = W - ml - mr, ch = H - mt - mb;
+
+  // World bounds to show
+  const zMin = 0, zMax = 12, xMin = -4, xMax = 4;
+
+  function toScreen(z, x) {
+    return [ ml + (z - zMin) / (zMax - zMin) * cw, mt + ch - (x - xMin) / (xMax - xMin) * ch ];
+  }
+
+  c.clearRect(0, 0, W, H);
+
+  // Background
+  c.fillStyle = '#1a1a2e';
+  c.fillRect(0, 0, W, H);
+
+  // Title
+  c.fillStyle = '#eee';
+  c.font = 'bold 20px monospace';
+  c.textAlign = 'center';
+  c.fillText('Landing Positions — Top View (Z→, X↔)', W/2, 30);
+
+  // Grid
+  c.strokeStyle = '#333';
+  c.lineWidth = 1;
+  for (let z = 0; z <= 12; z += 1) {
+    const [sx, sy] = toScreen(z, 0);
+    c.beginPath(); c.moveTo(sx, mt); c.lineTo(sx, H-mb); c.stroke();
+  }
+  for (let x = -4; x <= 4; x += 1) {
+    const [sx, sy] = toScreen(0, x);
+    c.beginPath(); c.moveTo(ml, sy); c.lineTo(W-mr, sy); c.stroke();
+  }
+
+  // Axis labels
+  c.fillStyle = '#888';
+  c.font = '11px monospace';
+  c.textAlign = 'center';
+  for (let z = 0; z <= 12; z += 2) {
+    const [sx, sy] = toScreen(z, xMin);
+    c.fillText(z+'m', sx, H - mb + 16);
+  }
+  c.textAlign = 'right';
+  for (let x = -4; x <= 4; x += 1) {
+    const [sx, sy] = toScreen(zMin, x);
+    c.fillText(x+'m', ml - 8, sy + 4);
+  }
+  c.textAlign = 'left';
+  c.fillStyle = '#666';
+  c.font = '10px monospace';
+  c.fillText('→ Z (range)', W - mr - 10, H - 10);
+  c.fillText('X (lateral) ↑', 8, mt + 12);
+
+  // Target board outline at z=7.5
+  const [bz1, by1] = toScreen(TARGET_BOARD_Z, -1.5);
+  const [bz2, by2] = toScreen(TARGET_BOARD_Z, 1.5);
+  c.strokeStyle = '#445';
+  c.lineWidth = 2;
+  c.setLineDash([4, 4]);
+  c.beginPath(); c.moveTo(bz1, by1); c.lineTo(bz2, by2); c.stroke();
+  c.setLineDash([]);
+
+  // Target circles
+  for (const t of TARGET_DEFS) {
+    const [cz, cx] = toScreen(TARGET_BOARD_Z, t.x);
+    const r = t.r / (zMax - zMin) * cw;
+    c.strokeStyle = t.bonus ? '#ff8844' : '#88aaff';
+    c.lineWidth = t.bonus ? 2 : 1.5;
+    c.beginPath();
+    c.arc(cz, cx, Math.max(r, 4), 0, Math.PI*2);
+    c.stroke();
+    if (t.bonus) {
+      c.fillStyle = 'rgba(255,136,68,0.08)';
+      c.beginPath(); c.arc(cz, cx, Math.max(r, 4), 0, Math.PI*2); c.fill();
+    }
+  }
+
+  // Per-target hit counts (from validator.results)
+  const targetHitCounts = {};
+  for (const key in validator.results) {
+    const r = validator.results[key];
+    for (const tid in (r.targetHits || {})) {
+      targetHitCounts[tid] = (targetHitCounts[tid] || 0) + r.targetHits[tid];
+    }
+  }
+  // Also count hits from validatedTargets
+  for (const vt of validator.validatedTargets) {
+    targetHitCounts[vt.targetId] = (targetHitCounts[vt.targetId] || 0) + vt.hits;
+  }
+
+  // Legend
+  c.font = '12px monospace';
+  c.textAlign = 'left';
+  c.fillStyle = '#4c4';
+  c.fillRect(W - 170, 50, 10, 10);
+  c.fillText('Hit', W - 155, 60);
+  c.fillStyle = '#c44';
+  c.fillRect(W - 170, 68, 10, 10);
+  c.fillText('Miss', W - 155, 78);
+  c.fillStyle = '#ff4';
+  c.fillRect(W - 170, 86, 10, 10);
+  c.fillText('Early Fail', W - 155, 96);
+
+  // Stats from validator.results
+  let total = 0, hits = 0, hasPos = 0;
+  for (const key in validator.results) {
+    const r = validator.results[key];
+    total += r.total;
+    hits += r.hits;
+    if (r.landX && r.landX.length > 0) hasPos += r.landX.length;
+  }
+  const earlyFail = total - hasPos;
+  c.fillStyle = '#aaa';
+  c.font = '12px monospace';
+  c.textAlign = 'right';
+  c.fillText(`Trials: ${total}  Hits: ${hits} (${total ? (hits/total*100).toFixed(1) : 0}%)  NoPos: ${earlyFail}`, W - 20, H - 16);
+
+  // Level summary instead of generation trend
+  let levelStr = '';
+  const targetTotal = validator.targetOrder.length;
+  for (let i = 0; i < VAL_LEVEL_TRIALS.length; i++) {
+    const done = validator.validatedTargets.filter(v => v.level === i).length;
+    if (done > 0) {
+      levelStr += `${i ? ' | ' : ''}L${i}: ${done}/${targetTotal} (${VAL_LEVEL_TRIALS[i]}tr)`;
+    }
+  }
+  if (levelStr) {
+    c.textAlign = 'left';
+    c.font = '11px monospace';
+    c.fillStyle = '#8af';
+    c.fillText(levelStr, ml + 10, mt + 130);
+  }
+
+  // Per-target validation status table (top-left)
+  const tgtStatusList = validator.validatedTargets.concat(validator.failedTargets);
+  if (tgtStatusList.length > 0) {
+    c.textAlign = 'left';
+    c.font = '11px monospace';
+    c.fillStyle = '#8af';
+    c.fillText('Target status', ml + 10, mt + 150);
+    c.font = '10px monospace';
+    let ty = mt + 166;
+    // Show each target in order
+    for (const tgtId of validator.targetOrder) {
+      const vt = validator.validatedTargets.find(v => v.targetId === tgtId);
+      const ft = validator.failedTargets.find(f => f.targetId === tgtId);
+      const n = targetHitCounts[tgtId] || 0;
+      if (vt) {
+        c.fillStyle = '#4c4';
+        c.fillText(`${tgtId} ✓ L${vt.level} ${(vt.acc*100).toFixed(0)}% (${n})`, ml + 14, ty);
+      } else if (ft) {
+        c.fillStyle = '#c44';
+        c.fillText(`${tgtId} ✗ L${ft.level} ${(ft.bestAcc*100).toFixed(0)}% (${n})`, ml + 14, ty);
+      } else {
+        c.fillStyle = n > 0 ? '#aa4' : '#555';
+        c.fillText(`${tgtId} — (${n})`, ml + 14, ty);
+      }
+      ty += 16;
+      if (ty > H - mb - 20) break;
+    }
+  }
+
+  // Plot landing positions from validator.results (all in neutral color;
+  // per-trial hit/miss isn't tracked individually in aggregate results)
+  for (const key in validator.results) {
+    const r = validator.results[key];
+    if (!r.landZ || !r.landX) continue;
+    const acc = r.total > 0 ? r.hits / r.total : 0;
+    for (let i = 0; i < r.landZ.length; i++) {
+      const z = r.landZ[i];
+      const x = r.landX[i];
+      if (z == null || x == null) continue;
+      const [sx, sy] = toScreen(z, x);
+      if (sx < ml || sx > W-mr || sy < mt || sy > H-mb) continue;
+      // Color by set accuracy: greenish for high-acc sets, reddish for low
+      c.fillStyle = acc >= 0.7 ? '#4a8' : acc >= 0.4 ? '#aa4' : '#844';
+      c.globalAlpha = 0.6;
+      c.beginPath();
+      c.arc(sx, sy, 3, 0, Math.PI*2);
+      c.fill();
+      c.globalAlpha = 1;
+    }
+  }
+
+  // Early fail note
+  if (earlyFail > 0) {
+    c.fillStyle = '#ff4';
+    c.font = '10px monospace';
+    c.textAlign = 'center';
+    c.fillText(`✕ ${earlyFail} no-pos trials`, ml + 60, mt + 14);
+    c.fillRect(ml + 10, mt + 8, 8, 8);
+  }
+
+  // Close hint
+  c.fillStyle = '#555';
+  c.font = '11px monospace';
+  c.textAlign = 'center';
+  c.fillText('Click anywhere to close', W/2, H - 8);
+}
+
+// ===== End Diagnostics =====
+
+// ===== 3D Trajectory Chart =====
+let traj3D = { renderer: null, scene: null, camera: null, controls: null, overlay: null, lines: [], animId: null };
+const TRAJ_COLORS = { good: 0x44cc44, almost: 0xcccc44, bad: 0xcc4444 };
+const TRAJ_ACC_THRESHOLDS = { good: 0.8, almost: 0.5 };
+
+function trajAccCategory(acc) {
+  if (acc >= TRAJ_ACC_THRESHOLDS.good) return 'good';
+  if (acc >= TRAJ_ACC_THRESHOLDS.almost) return 'almost';
+  return 'bad';
+}
+
+function showTrajectory3D() {
+  if (traj3D.overlay) { hideTrajectory3D(); return; }
+
+  // Count how many trajectories we have
+  let totalTrajs = 0;
+  const byCat = { good: 0, almost: 0, bad: 0 };
+  for (const key in validator.results) {
+    const r = validator.results[key];
+    if (!r.trajectories || r.trajectories.length === 0) continue;
+    const acc = r.total > 0 ? r.hits / r.total : 0;
+    const cat = trajAccCategory(acc);
+    byCat[cat] += r.trajectories.length;
+    totalTrajs += r.trajectories.length;
+  }
+  if (totalTrajs === 0) { log('No trajectory data. Run validation first.'); return; }
+
+  // Create overlay
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:100;background:#111;display:flex;flex-direction:column;';
+  traj3D.overlay = overlay;
+
+  // Filter bar
+  const filterBar = document.createElement('div');
+  filterBar.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px 16px;background:#1a1a2e;border-bottom:1px solid #333;font:12px monospace;color:#ccc;flex-shrink:0;';
+  filterBar.innerHTML = `<span style="color:#888">Trajectory 3D (${totalTrajs} paths)</span>`;
+  const filters = { good: true, almost: true, bad: true };
+  for (const [cat, label, color] of [['good','Good ≥80%','#4c4'],['almost','Almost 50-80%','#cc4'],['bad','Bad <50%','#c44']]) {
+    const chk = document.createElement('input');
+    chk.type = 'checkbox'; chk.checked = true;
+    chk.style.margin = '0 4px 0 8px';
+    const lbl = document.createElement('span');
+    lbl.style.color = color;
+    lbl.textContent = `${label} (${byCat[cat]})`;
+    chk.addEventListener('change', () => { filters[cat] = chk.checked; rebuildTraj3D(); });
+    filterBar.appendChild(chk); filterBar.appendChild(lbl);
+  }
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕ Close';
+  closeBtn.style.cssText = 'margin-left:auto;background:#333;border:1px solid #555;color:#eee;padding:3px 10px;border-radius:3px;cursor:pointer;font:11px monospace;';
+  closeBtn.onclick = hideTrajectory3D;
+  filterBar.appendChild(closeBtn);
+  overlay.appendChild(filterBar);
+
+  // Canvas container
+  const container = document.createElement('div');
+  container.style.cssText = 'flex:1;position:relative;';
+  overlay.appendChild(container);
+  document.body.appendChild(overlay);
+
+  // Three.js setup
+  const W = container.clientWidth || window.innerWidth;
+  const H = container.clientHeight || window.innerHeight;
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setSize(W, H);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setClearColor(0x111122);
+  container.appendChild(renderer.domElement);
+  traj3D.renderer = renderer;
+
+  const scene = new THREE.Scene();
+  traj3D.scene = scene;
+
+  const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 50);
+  camera.position.set(6, 5, -4);
+  camera.lookAt(0, 1, 4);
+  traj3D.camera = camera;
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1, 4);
+  controls.update();
+  traj3D.controls = controls;
+
+  // Lighting
+  scene.add(new THREE.AmbientLight(0x404060));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.8);
+  dl.position.set(5, 10, 7);
+  scene.add(dl);
+  scene.add(new THREE.DirectionalLight(0xffffff, 0.3).position.set(-3, 5, -5));
+
+  // Floor grid
+  const grid = new THREE.GridHelper(14, 14, 0x444466, 0x333355);
+  grid.position.y = -0.01;
+  scene.add(grid);
+
+  // Axes helper (colored arrows)
+  const axesLen = 0.8;
+  const makeArrow = (dir, color, label) => {
+    const arrow = new THREE.ArrowHelper(new THREE.Vector3(dir[0], dir[1], dir[2]), new THREE.Vector3(0, 0, 0), axesLen, color, 0.15, 0.1);
+    scene.add(arrow);
+  };
+  makeArrow([1,0,0], 0xff4444); // X: red
+  makeArrow([0,1,0], 0x44ff44); // Y: green
+  makeArrow([0,0,1], 0x4444ff); // Z: blue
+
+  // Target board indicator (transparent plane at z=7.5)
+  const boardGeo = new THREE.PlaneGeometry(3.0, 3.4);
+  const boardMat = new THREE.MeshBasicMaterial({ color: 0x4466aa, transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false });
+  const boardMesh = new THREE.Mesh(boardGeo, boardMat);
+  boardMesh.position.set(0, 1.7, 7.5);
+  scene.add(boardMesh);
+  // Board edge outline
+  const edgePts = [[-1.5,-1.7,0],[1.5,-1.7,0],[1.5,1.7,0],[-1.5,1.7,0],[-1.5,-1.7,0]].map(([x,y,z]) => new THREE.Vector3(x, y+1.7, z+7.5));
+  const edgeGeo2 = new THREE.BufferGeometry().setFromPoints(edgePts);
+  const edgeLine2 = new THREE.Line(edgeGeo2, new THREE.LineBasicMaterial({ color: 0x4466aa, transparent: true, opacity: 0.2 }));
+  scene.add(edgeLine2);
+
+  // Target hole rings
+  for (const h of BOARD.holes) {
+    const ringGeo = new THREE.RingGeometry(h.r * 0.6, h.r * 1.0, 24);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x88dd88, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.position.set(h.x, h.y, 7.5);
+    scene.add(ring);
+  }
+
+  // Trebuchet position marker
+  const tretPts = [new THREE.Vector3(config.posX, 0, config.posZ), new THREE.Vector3(config.posX, 0.5, config.posZ)];
+  const tretGeo = new THREE.BufferGeometry().setFromPoints(tretPts);
+  scene.add(new THREE.Line(tretGeo, new THREE.LineBasicMaterial({ color: 0x888888 })));
+
+  traj3D.lines = [];
+  scene.userData.filters = filters;
+
+  function rebuildTraj3D() {
+    // Remove old lines
+    for (const l of traj3D.lines) { scene.remove(l); if (l.geometry) l.geometry.dispose(); if (l.material) l.material.dispose(); }
+    traj3D.lines = [];
+    const f = scene.userData.filters || { good: true, almost: true, bad: true };
+    for (const key in validator.results) {
+      const r = validator.results[key];
+      if (!r.trajectories || r.trajectories.length === 0) continue;
+      const acc = r.total > 0 ? r.hits / r.total : 0;
+      const cat = trajAccCategory(acc);
+      if (!f[cat]) continue;
+      const color = TRAJ_COLORS[cat];
+      for (const traj of r.trajectories) {
+        const pts = traj.points;
+        if (pts.length < 6) continue;
+        const vecs = [];
+        for (let i = 0; i < pts.length; i += 3) {
+          vecs.push(new THREE.Vector3(pts[i], pts[i + 1], pts[i + 2]));
+        }
+        const geo = new THREE.BufferGeometry().setFromPoints(vecs);
+        const mat = new THREE.LineBasicMaterial({
+          color, transparent: true, opacity: traj.hit ? 0.9 : 0.35,
+        });
+        const line = new THREE.Line(geo, mat);
+        scene.add(line);
+        traj3D.lines.push(line);
+      }
+    }
+  }
+
+  scene.userData.rebuild = rebuildTraj3D;
+  rebuildTraj3D();
+
+  function animateTraj() {
+    if (!traj3D.overlay) return;
+    traj3D.animId = requestAnimationFrame(animateTraj);
+    traj3D.controls.update();
+    traj3D.renderer.render(traj3D.scene, traj3D.camera);
+  }
+  animateTraj();
+
+  // Resize handler
+  const onResize = () => {
+    const w = container.clientWidth, h = container.clientHeight;
+    if (w > 0 && h > 0) {
+      traj3D.camera.aspect = w / h;
+      traj3D.camera.updateProjectionMatrix();
+      traj3D.renderer.setSize(w, h);
+    }
+  };
+  window.addEventListener('resize', onResize);
+  traj3D._resizeHandler = onResize;
+}
+
+function hideTrajectory3D() {
+  if (traj3D.animId) { cancelAnimationFrame(traj3D.animId); traj3D.animId = null; }
+  if (traj3D._resizeHandler) { window.removeEventListener('resize', traj3D._resizeHandler); }
+  if (traj3D.renderer) { traj3D.renderer.dispose(); traj3D.renderer = null; }
+  if (traj3D.controls) { traj3D.controls.dispose(); traj3D.controls = null; }
+  if (traj3D.overlay) { traj3D.overlay.remove(); traj3D.overlay = null; }
+  traj3D.scene = null; traj3D.camera = null; traj3D.lines = [];
+}
+
+function rebuildTraj3D() {
+  if (traj3D.scene && traj3D.scene.userData.rebuild) traj3D.scene.userData.rebuild();
+}
+// ===== End 3D Trajectory Chart =====
+
+// ===== Validation Results Table =====
+let resultsOverlay = null;
+
+function drawResultsTable() {
+  const totalHits = Object.values(validator.results).reduce((s, r) => s + r.hits, 0);
+  const totalTrials = Object.values(validator.results).reduce((s, r) => s + r.total, 0);
+  const overallAcc = totalTrials > 0 ? (totalHits / totalTrials * 100).toFixed(1) : 0;
+
+  const level = validator.validationLevel;
+  const lvlTrials = validator.levelTrials;
+  const validated = validator.validatedTargets.filter(v => v.level === level).length;
+  const totalTgts = validator.targetOrder.length;
+  const current = currentTargetId() || '-';
+
+  const levelSummary = VAL_LEVEL_TRIALS.map((t, i) => {
+    const done = validator.validatedTargets.filter(v => v.level === i).length;
+    return i === level ? `L${i}(${t}tr):${done}/${totalTgts}` : `L${i}:${done}/${totalTgts}`;
+  }).join(' | ');
+
+  setStatus(`Level ${level} (${lvlTrials}tri): ${validated}/${totalTgts} targets  Acc: ${overallAcc}%  Current: ${current}  [${levelSummary}]`);
+}
+
+function showResults() {
+  if (resultsOverlay) {
+    resultsOverlay.remove();
+    resultsOverlay = null;
+    return;
+  }
+  const keys = Object.keys(validator.results);
+  if (keys.length === 0) { log('No validation results to show.'); return; }
+
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:100;background:rgba(10,10,10,0.92);overflow:auto;cursor:pointer;';
+  overlay.addEventListener('click', () => { overlay.remove(); resultsOverlay = null; });
+
+  const sorted = keys.map(k => ({ key: k, ...computeStats(validator.results[k]) }))
+    .sort((a, b) => b.reliability - a.reliability || b.acc - a.acc);
+
+  // Build per-target validation summary
+  let tgtStatus = '<div style="margin:10px 0;font-size:12px">';
+  for (const tgtId of validator.targetOrder) {
+    const vt = validator.validatedTargets.find(v => v.targetId === tgtId);
+    const ft = validator.failedTargets.find(f => f.targetId === tgtId);
+    let status = '—';
+    let color = '#555';
+    if (vt) { status = `✓L${vt.level}/${vt.trials}tr ${(vt.acc*100).toFixed(0)}%`; color = '#4c4'; }
+    else if (ft) { status = `✗L${ft.level} ${(ft.bestAcc*100).toFixed(0)}%`; color = '#c44'; }
+    tgtStatus += `<span style="color:${color};margin-right:12px">${tgtId}: ${status}</span>`;
+  }
+  tgtStatus += '</div>';
+
+  let html = `<div style="max-width:1200px;margin:30px auto;font-family:monospace;color:#eee;padding:20px;cursor:default" onclick="event.stopPropagation()">
+    <h2 style="text-align:center;color:#ffcc44;margin-bottom:6px">Validation Results —
+      Level ${validator.validationLevel} (${validator.levelTrials} trials)</h2>
+    <p style="text-align:center;font-size:13px;color:#aaa;margin:4px 0 12px">
+      ${validator.validatedTargets.filter(v => v.level === validator.validationLevel).length}/${validator.targetOrder.length} targets solved</p>
+    ${tgtStatus}
+    <table style="width:100%;border-collapse:collapse;font-size:11px;margin-top:8px">
+      <tr style="background:#222;position:sticky;top:0">
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">#</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Hits/Total</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Accuracy</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Avg Prox</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Clean/Dfl</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Avg Z</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Std Z</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Reliability</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">Val.&#8594;</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">posZ</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">heading</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">pivotH</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">torque</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">leverLd</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">leverCW</th>
+        <th style="padding:4px 6px;text-align:left;border-bottom:1px solid #444">release</th>
+      </tr>`;
+
+  for (let i = 0; i < sorted.length; i++) {
+    const s = sorted[i];
+    const r = validator.results[s.key];
+    const params = r.params;
+    const rowColor = i % 2 === 0 ? '#1a1a2e' : '#222240';
+    const accColor = s.acc >= 80 ? '#4c4' : s.acc >= 50 ? '#cc4' : '#c44';
+    const relColor = s.reliability >= 80 ? '#4c4' : s.reliability >= 50 ? '#cc4' : '#c44';
+    // Which targets did this set validate?
+    let valFor = '';
+    for (const vt of validator.validatedTargets) {
+      if (JSON.stringify(vt.params) === s.key) valFor += (valFor ? ',' : '') + vt.targetId;
+    }
+    html += `<tr style="background:${rowColor}">
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${i + 1}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${s.hits}/${s.total}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333;color:${accColor}">${s.acc.toFixed(1)}%</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${(s.avgProx * 100).toFixed(0)}%</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${s.cleanCount}/${s.deflectCount}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${s.avgZ != null ? s.avgZ.toFixed(3) : '?'}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${s.stdZ != null ? s.stdZ.toFixed(3) : '?'}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333;color:${relColor}">${s.reliability.toFixed(0)}%</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333;color:#4c4">${valFor || '—'}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${params.posZ.toFixed(2)}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${params.heading.toFixed(1)}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${params.pivotHeight.toFixed(2)}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${params.motorTorque.toFixed(0)}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${params.leverLengthLoad.toFixed(2)}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${params.leverLengthCW.toFixed(2)}</td>
+      <td style="padding:3px 6px;border-bottom:1px solid #333">${params.releaseAngle.toFixed(0)}</td>
+    </tr>`;
+  }
+
+  html += `</table>
+    <p style="text-align:center;color:#555;margin-top:20px;font-size:11px">Click anywhere to close</p>
+  </div>`;
+
+  overlay.innerHTML = html;
+  document.body.appendChild(overlay);
+  resultsOverlay = overlay;
+}
+
+// ===== End Results Table =====
+
+// ===== Validator Functions =====
+
+function Vstart() {
+  if (validator.sets.length === 0) {
+    log('No parameter sets loaded. Load from memory or import CSV first.');
+    return;
+  }
+  buildTargetOrder();
+  if (!validator.running) {
+    // Only reset level/progress on a fresh start, not resume after STOP
+    if (validator.validatedTargets.length === 0 && validator.validationLevel === 0) {
+      validator.currentTargetIdx = 0;
+      validator.validationLevel = 0;
+      validator.levelTrials = VAL_LEVEL_TRIALS[0];
+    }
+    validator.currentSetIdx = 0;
+    validator.trialInSet = 0;
+    validator.hitsOnTarget = 0;
+    validator._bestAcc = 0;
+    validator._bestParams = null;
+  }
+  validator.running = true;
+
+  // Initialize results for any new sets
+  for (const s of validator.sets) {
+    const key = JSON.stringify(s.params);
+    if (!validator.results[key]) {
+      validator.results[key] = { params: { ...s.params }, hits: 0, total: 0, targetHits: {}, targetTotal: {}, landZ: [], landX: [], boardY: [], trajectories: [] };
+    }
+  }
+
+  // Skip already-solved targets at current level
+  while (validator.currentTargetIdx < validator.targetOrder.length && isTargetSolved(currentTargetId())) {
+    validator.currentTargetIdx++;
+  }
+
+  const tgt = currentTargetId();
+  if (!tgt) {
+    log(`All ${validator.targetOrder.length} targets solved at level ${validator.validationLevel}. Advancing.`);
+    VadvanceLevel();
+    return;
+  }
+  log(`=== Validation started: ${validator.sets.length} sets, Level ${validator.validationLevel} (${validator.levelTrials} trials per target) ===`);
+  log(`Target: ${tgt} (${validator.currentTargetIdx + 1}/${validator.targetOrder.length})`);
+  VnextTrial();
+}
+
+function Vstop() {
+  validator.running = false;
+  reportToTraining();
+  saveTraining();
+  const totalHits = Object.values(validator.results).reduce((s, r) => s + r.hits, 0);
+  const totalTrials = Object.values(validator.results).reduce((s, r) => s + r.total, 0);
+  const overallAcc = totalTrials > 0 ? (totalHits / totalTrials * 100).toFixed(1) : 0;
+  const validated = validator.validatedTargets.filter(v => v.level === validator.validationLevel).length;
+  log(`=== Stopped. Level ${validator.validationLevel}: ${validated}/${validator.targetOrder.length} targets. ${totalTrials} trials, ${totalHits} hits (${overallAcc}%) ===`);
+  updateValidationUI();
+}
+
+function VadvanceLevel() {
+  validator.validationLevel++;
+  if (validator.validationLevel >= VAL_LEVEL_TRIALS.length) {
+    log('=== All validation levels complete! ===');
+    Vstop();
+    return;
+  }
+  validator.levelTrials = VAL_LEVEL_TRIALS[validator.validationLevel];
+  validator.currentTargetIdx = 0;
+  // Clear per-level validation status; re-test all targets at new level
+  log(`=== Advancing to Level ${validator.validationLevel}: ${validator.levelTrials} trials per target ===`);
+  // Skip already-validated targets at this new level
+  while (validator.currentTargetIdx < validator.targetOrder.length && isTargetSolved(currentTargetId())) {
+    validator.currentTargetIdx++;
+  }
+  const tgt = currentTargetId();
+  if (!tgt) {
+    VadvanceLevel(); // all done
+    return;
+  }
+  VnextTrial();
+}
+
+function VnextTrial() {
+  if (!validator.running) return;
+  const tgt = currentTargetId();
+  if (!tgt) {
+    VadvanceLevel();
+    return;
+  }
+  if (validator.currentSetIdx >= validator.sets.length) {
+    // All sets exhausted for this target — it failed
+    validator.failedTargets.push({ targetId: tgt, level: validator.validationLevel, bestAcc: validator._bestAcc || 0, bestParams: validator._bestParams || null });
+    log(`✗ Target ${tgt} FAILED at level ${validator.validationLevel}. Best acc: ${((validator._bestAcc || 0) * 100).toFixed(1)}%`);
+    validator.currentTargetIdx++;
+    validator.currentSetIdx = 0;
+    validator._bestAcc = 0;
+    validator._bestParams = null;
+    // Skip already-solved
+    while (validator.currentTargetIdx < validator.targetOrder.length && isTargetSolved(currentTargetId())) {
+      validator.currentTargetIdx++;
+    }
+    VnextTrial();
+    return;
+  }
+  const set = validator.sets[validator.currentSetIdx];
+  validator.trialInSet = 0;
+  validator.hitsOnTarget = 0;
+  noisyTrial(set.params);
+  const R = predictRange(set.params).toFixed(1);
+  setStatus(`[Level ${validator.validationLevel}] Target ${tgt} (${validator.currentTargetIdx + 1}/${validator.targetOrder.length})  Set ${validator.currentSetIdx + 1}/${validator.sets.length}  Trial 1/${validator.levelTrials}  R=${R}m`);
+}
+
+function VrecordTrial(hit, pos) {
+  if (!validator.running) return;
+  const tgt = currentTargetId();
+  if (!tgt) { Vstop(); return; }
+  const set = validator.sets[validator.currentSetIdx];
+  const key = JSON.stringify(set.params);
+  if (!validator.results[key]) {
+    validator.results[key] = { params: { ...set.params }, hits: 0, total: 0, targetHits: {}, targetTotal: {}, landZ: [], landX: [], boardY: [], proximity: [], hitQualities: [] };
+  }
+  const r = validator.results[key];
+  r.total++;
+  if (hit) r.hits++;
+  if (pos) { r.landZ.push(pos.z); r.landX.push(pos.x); }
+  if (_boardCrossY != null) r.boardY.push(_boardCrossY);
+  r.proximity.push(_lastHitProximity);
+  r.hitQualities.push(_lastHitQuality);
+
+  // Check if the hit was specifically on the current target
+  const hitCurrentTarget = tgt && hitTargets.some(t => t.id === tgt);
+
+  // Track per-target hits (only for current target)
+  if (tgt) {
+    r.targetTotal[tgt] = (r.targetTotal[tgt] || 0) + 1;
+    if (hitCurrentTarget) r.targetHits[tgt] = (r.targetHits[tgt] || 0) + 1;
+  }
+
+  // hitsOnTarget counts only current-target hits
+  if (hitCurrentTarget) validator.hitsOnTarget++;
+  validator.totalTrials++;
+
+  // Save trajectory for this trial (downsampled)
+  if (trajectoryPoints.length > 0) {
+    if (!r.trajectories) r.trajectories = [];
+    const pts = trajectoryPoints;
+    const maxPts = 200;
+    const step = Math.max(3, Math.floor(pts.length / 3 / maxPts) * 3);
+    const sampled = [];
+    for (let i = 0; i < pts.length; i += step) {
+      if (i + 2 < pts.length) sampled.push(pts[i], pts[i + 1], pts[i + 2]);
+    }
+    r.trajectories.push({ points: sampled, hit: hitCurrentTarget, targetId: tgt });
+    if (r.trajectories.length > 5) r.trajectories.shift(); // keep last 5
+  }
+
+  const trialOnTarget = (r.targetTotal[tgt] || 0);
+  const hitsOnTarget = (r.targetHits[tgt] || 0);
+
+  validator.trialInSet++;
+  if (validator.trialInSet >= validator.levelTrials) {
+    const setAcc = validator.hitsOnTarget / validator.levelTrials;
+    // Track best final accuracy across all sets for this target
+    if (setAcc > validator._bestAcc) {
+      validator._bestAcc = setAcc;
+      validator._bestParams = { ...set.params };
+    }
+    if (setAcc >= VAL_THRESHOLD) {
+      // Target validated!
+      validator.validatedTargets.push({
+        targetId: tgt,
+        level: validator.validationLevel,
+        params: { ...set.params },
+        acc: setAcc,
+        trials: validator.levelTrials,
+        hits: validator.hitsOnTarget,
+      });
+      validator.validatedCounts[tgt] = (validator.validatedCounts[tgt] || []);
+      if (!validator.validatedCounts[tgt][validator.validationLevel]) {
+        validator.validatedCounts[tgt][validator.validationLevel] = 1;
+      } else {
+        validator.validatedCounts[tgt][validator.validationLevel]++;
+      }
+      log(`✓ Target ${tgt} VALIDATED at level ${validator.validationLevel}: ${validator.hitsOnTarget}/${validator.levelTrials} (${(setAcc * 100).toFixed(1)}%)`);
+      reportToTraining();
+      saveTraining();
+      validator.currentTargetIdx++;
+      validator.currentSetIdx = 0;
+      validator._bestAcc = 0;
+      validator._bestParams = null;
+      // Skip already-solved targets
+      while (validator.currentTargetIdx < validator.targetOrder.length && isTargetSolved(currentTargetId())) {
+        validator.currentTargetIdx++;
+      }
+      updateValidationUI();
+      VnextTrial();
+      return;
+    }
+    // This set didn't meet threshold, try next
+    log(`Set ${validator.currentSetIdx + 1} for ${tgt}: ${validator.hitsOnTarget}/${validator.levelTrials} (${(setAcc * 100).toFixed(1)}%) — below threshold.`);
+    validator.currentSetIdx++;
+    updateValidationUI();
+    VnextTrial();
+    return;
+  }
+  // Continue current set
+  const setIdx = validator.currentSetIdx + 1;
+  const totalSets = validator.sets.length;
+  const trialNum = validator.trialInSet + 1;
+  const R = predictRange(set.params).toFixed(1);
+  setStatus(`[Level ${validator.validationLevel}] Target ${tgt} (${validator.currentTargetIdx + 1}/${validator.targetOrder.length})  Set ${setIdx}/${totalSets}  Trial ${trialNum}/${validator.levelTrials}  R=${R}m`);
+  noisyTrial(set.params);
+}
+
+function VloadFromMemory() {
+  const raw = localStorage.getItem('trebuchet_ai_training');
+  if (!raw) { log('No training data found in memory.'); return; }
+  try {
+    const d = JSON.parse(raw);
+    const byParams = {};
+    for (const t of d.trials || []) {
+      const key = JSON.stringify(t.p);
+      if (!byParams[key]) byParams[key] = { params: t.p, hits: 0, total: 0, targetHits: {}, targetTotal: {} };
+      byParams[key].total++;
+      if (t.hit) byParams[key].hits++;
+      if (t.targetId) {
+        byParams[key].targetTotal[t.targetId] = (byParams[key].targetTotal[t.targetId] || 0) + 1;
+        if (t.hit) byParams[key].targetHits[t.targetId] = (byParams[key].targetHits[t.targetId] || 0) + 1;
+      }
+    }
+    // Build sets sorted by overall hit rate
+    const sets = [];
+    for (const key in byParams) {
+      const e = byParams[key];
+      const acc = e.total > 0 ? e.hits / e.total : 0;
+      if (acc >= 0.4) {
+        sets.push({ params: e.params, label: `acc${(acc * 100).toFixed(0)}_n${e.total}` });
+      }
+    }
+    sets.sort((a, b) => {
+      const aAcc = byParams[JSON.stringify(a.params)].hits / byParams[JSON.stringify(a.params)].total;
+      const bAcc = byParams[JSON.stringify(b.params)].hits / byParams[JSON.stringify(b.params)].total;
+      return bAcc - aAcc;
+    });
+    // Include savedSets explicitly
+    if (d.savedSets) {
+      for (const s of d.savedSets) {
+        const key = JSON.stringify(s.params);
+        if (!byParams[key] || (byParams[key].hits / byParams[key].total) < 0.95) {
+          sets.unshift({ params: s.params, label: `saved_${(s.fitness * 100).toFixed(0)}` });
+        }
+      }
+    }
+    validator.sets = sets.slice(0, 50);
+    validator.results = {};
+    validator.currentTargetIdx = 0;
+    validator.currentSetIdx = 0;
+    validator.totalTrials = 0;
+    saveTraining();
+    log(`Loaded ${validator.sets.length} parameter sets from training memory. START to validate.`);
+    updateValidationUI();
+  } catch (e) { log('Error loading training data.'); }
+}
+
+function VloadFromCSV() {
+  document.getElementById('csvInput').click();
+}
+
+function updateValidationUI() {
+  drawResultsTable();
+}
+
+function clearResults() {
+  validator.results = {};
+  validator.sets = [];
+  validator.targetOrder = [];
+  validator.currentTargetIdx = 0;
+  validator.currentSetIdx = 0;
+  validator.totalTrials = 0;
+  validator.validatedTargets = [];
+  validator.failedTargets = [];
+  validator.validationLevel = 0;
+  validator.levelTrials = VAL_LEVEL_TRIALS[0];
+  validator._bestAcc = 0;
+  validator._bestParams = null;
+  validator.validatedCounts = {};
+  saveTraining();
+  log('Validation data cleared.');
+  drawResultsTable();
+}
+
+function syncPhysicsVisuals() {
+  if (!armBody || !trebuchetGroup) return;
+
+  // Sync arm wrapper group to physics body
+  armGroup.position.copy(armBody.position);
+  armGroup.quaternion.copy(armBody.quaternion);
+
+  // Sync ball mesh — follows ball body directly
+  if (ballBody && ballMesh) {
+    ballMesh.position.copy(ballBody.position);
+    ballMesh.quaternion.copy(ballBody.quaternion);
+  }
+
+  // Trajectory trail (fixed-size ring buffer)
+  if (released && ballBody) {
+    trajectoryPoints.push(
+      ballBody.position.x, ballBody.position.y, ballBody.position.z
+    );
+    const totalFloats = trajectoryPoints.length;
+    const count = Math.min(totalFloats / 3, MAX_TRAIL);
+    const skip = totalFloats > MAX_TRAIL * 3 ? totalFloats - MAX_TRAIL * 3 : 0;
+    for (let i = 0; i < count * 3; i++) {
+      trailBuffer[i] = trajectoryPoints[skip + i];
+    }
+    trailLine.geometry.attributes.position.needsUpdate = true;
+    trailLine.geometry.setDrawRange(0, count);
+  }
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const dt = Math.min(clock.getDelta(), 0.033);
+
+  // Fast-forward: run multiple physics steps per frame when validating
+  const ffSteps = (validator.running && (fired || released)) ? 12 : 1;
+
+  for (let s = 0; s < ffSteps; s++) {
+    // Motor-driven arm: keep ball at arm tip before release
+    if (fired && !released && ballBody && armBody) updateCatapultBall();
+    if (world) world.step(1 / 60, 1 / 60, validator.running ? 3 : 1);
+    if (fired && !released) checkRelease();
+
+    if (released && !landed) {
+      if (ballBody && _boardCrossY === null) {
+        const bz = ballBody.position.z;
+        if (bz >= BOARD.centerZ - 0.15 && bz <= BOARD.centerZ + 0.15) {
+          _boardCrossY = ballBody.position.y;
+          _boardCrossVx = ballBody.velocity.x;
+          _boardCrossVy = ballBody.velocity.y;
+          _boardCrossVz = ballBody.velocity.z;
+        }
+      }
+      if (validator.running && earlyFailCheck()) {
+        landed = true;
+        const p = ballBody.position;
+        VrecordTrial(false, { x: p.x, z: p.z });
+        break;
+      }
+      checkTargetHit();
+      checkLanding();
+      if (landed) break; // VrecordTrial may have started new trial
+    }
+    if (!fired) break; // resetSim was called, trial ended
+  }
+
+  syncPhysicsVisuals();
+  controls.update();
+  renderer.render(scene, camera);
+
+  // Catch up clock dt so next frame doesn't try to compensate
+  if (validator.running) clock.start();
+}
+
+// ===== GUI =====
+function initGUI() {
+  const gui = new GUI({ title: 'Trebuchet Controls', width: 300 });
+  gui.domElement.style.fontSize = '13px';
+
+  const posFolder = gui.addFolder('Position & Heading');
+  posFolder.add(config, 'posX', -1.8, 1.8, 0.01).name('Pos X (m)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  posFolder.add(config, 'posZ', 0.5, 4.5, 0.01).name('Pos Z (m)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  posFolder.add(config, 'heading', -180, 180, 1).name('Heading (deg)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  posFolder.open();
+
+  const mechFolder = gui.addFolder('Mechanism');
+  mechFolder.add(config, 'pivotHeight', 0.3, 2.0, 0.01).name('Pivot Height (m)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  mechFolder.add(config, 'leverLengthLoad', 0.3, 2.0, 0.01).name('Lever Load (m)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  mechFolder.add(config, 'leverLengthCW', 0.2, 1.5, 0.01).name('Lever CW (m)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  mechFolder.add(config, 'motorTorque', 5, 200, 0.5).name('Motor Torque (Nm)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  mechFolder.open();
+
+  const projFolder = gui.addFolder('Projectile & Release');
+  projFolder.add(config, 'releaseAngle', 30, 100, 1).name('Release Angle (°)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+  });
+  projFolder.open();
+
+  const massFolder = gui.addFolder('Robot Mass (max 30kg)');
+  massFolder.add(config, 'armMass', 1, 15, 0.5).name('Arm Mass (kg)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+    updateMassReadout();
+  });
+  massFolder.add(config, 'baseMass', 1, 15, 0.5).name('Base Mass (kg)').onChange(() => {
+    if (!fired && !validator.running) resetSim();
+    updateMassReadout();
+  });
+  const massState = { total: config.armMass + config.baseMass };
+  const massCtrl = massFolder.add(massState, 'total').name('⚖ Total (kg)').disable();
+  let updateMassReadout = function() {
+    const t = config.armMass + config.baseMass;
+    massState.total = t;
+    massCtrl.updateDisplay();
+    if (t > 30) massCtrl.domElement.style.color = '#f44';
+    else massCtrl.domElement.style.color = '#4c4';
+  };
+  updateMassReadout();
+  massFolder.open();
+
+  // Validator controls
+  let valMode = false;
+  const valCtrl = {
+    'Validate': false,
+    START: () => { valMode = true; valCtrl['Validate'] = true; Vstart(); },
+    STOP: () => { valMode = false; valCtrl['Validate'] = false; Vstop(); },
+    'Load from Memory': () => VloadFromMemory(),
+    'Import CSV': () => VloadFromCSV(),
+    'Export CSV': () => exportCSV(),
+    'Clear': () => clearResults(),
+    'Level': 0,
+  };
+  const valFolder = gui.addFolder('Validation Arena');
+  valFolder.add(valCtrl, 'Validate').name('▶ Validate').onChange(v => {
+    if (v && !validator.running) { valMode = true; Vstart(); }
+    else if (!v && validator.running) { valMode = false; Vstop(); }
+  });
+  valFolder.add(valCtrl, 'START').name('▶ Start');
+  valFolder.add(valCtrl, 'STOP').name('■ Stop');
+  valFolder.add(valCtrl, 'Load from Memory').name('📂 Load from Memory');
+  valFolder.add(valCtrl, 'Import CSV').name('📥 Import Params CSV');
+  valFolder.add(valCtrl, 'Export CSV').name('💾 Export Results');
+  valFolder.add(validator, 'validationLevel').name('Level').disable();
+  valFolder.add(valCtrl, 'Clear').name('🗑 Clear');
+  valFolder.open();
+
+  const actions = {
+    FIRE: () => fireTrebuchet(),
+    RESET: () => resetSim(),
+    'Top View': () => {
+      camera.position.set(0, 12, 4);
+      controls.target.set(0, 0.5, 4);
+      controls.update();
+    },
+    'Side View': () => {
+      camera.position.set(12, 4, 4);
+      controls.target.set(0, 1, 4);
+      controls.update();
+    },
+  };
+  const actFolder = gui.addFolder('Actions');
+  actFolder.add(actions, 'FIRE').name('🔥 FIRE');
+  actFolder.add(actions, 'RESET').name('↺ RESET');
+  actFolder.add(actions, 'Top View').name('Top View');
+  actFolder.add(actions, 'Side View').name('Side View');
+  actFolder.open();
+
+  const diagFolder = gui.addFolder('Diagnostics');
+  diagFolder.add({ 'Show Chart': () => showChart() }, 'Show Chart').name('📊 Show Chart');
+  diagFolder.add({ '3D Trajectory': () => showTrajectory3D() }, '3D Trajectory').name('🛤 3D Trajectories');
+  diagFolder.add({ 'Show Results': () => showResults() }, 'Show Results').name('📋 Show Results');
+  diagFolder.open();
+
+  const modelFolder = gui.addFolder('CAD Models');
+  modelFolder.add(config, 'modelScale', 0.001, 10, 0.001).name('Scale').onChange(() => {
+    if (!fired) resetSim();
+  });
+  modelFolder.add({ 'Reload Models': () => loadGLBModels() }, 'Reload Models').name('🔄 Reload');
+  modelFolder.open();
+
+  const calFolder = gui.addFolder('Calibration (CAD Offset)');
+  calFolder.add(config, 'meshOffsetX', -2, 2, 0.01).name('Mesh Offset X').onChange(v => { if (armMesh) armMesh.position.x = v; });
+  calFolder.add(config, 'meshOffsetY', -2, 2, 0.01).name('Mesh Offset Y').onChange(v => { if (armMesh) armMesh.position.y = v; });
+  calFolder.add(config, 'meshOffsetZ', -2, 2, 0.01).name('Mesh Offset Z').onChange(v => { if (armMesh) armMesh.position.z = v; });
+  calFolder.add(config, 'basePivotX', -2, 2, 0.01).name('Base Pivot X').onChange(() => { if (!fired) resetSim(); });
+  calFolder.add(config, 'basePivotY', -2, 2, 0.01).name('Base Pivot Y').onChange(() => { if (!fired) resetSim(); });
+  calFolder.add(config, 'basePivotZ', -2, 2, 0.01).name('Base Pivot Z').onChange(() => { if (!fired) resetSim(); });
+  const gizmoState = { enabled: false, target: 'Arm Pivot' };
+  calFolder.add(gizmoState, 'enabled').name('🔧 3D Gizmo').onChange(v => {
+    if (!transformCtrl) return;
+    transformCtrl.visible = v;
+    if (!v) { transformCtrl.detach(); return; }
+    const tgt = gizmoState.target === 'Arm Pivot' ? pivotDot : gizmoState.target === 'Ball Offset' ? pivotDotGreen : pivotDotOrange;
+    if (tgt) transformCtrl.attach(tgt);
+  });
+  calFolder.add(gizmoState, 'target', ['Arm Pivot', 'Base Pivot', 'Ball Offset']).name('Target').onChange(v => {
+    gizmoTarget = v;
+    if (!transformCtrl || !transformCtrl.visible) return;
+    const tgt = v === 'Arm Pivot' ? pivotDot : v === 'Ball Offset' ? pivotDotGreen : pivotDotOrange;
+    if (tgt) transformCtrl.attach(tgt);
+  });
+  calFolder.open();
+
+  return gui;
+}
+
+// Bind file input in module scope
+document.getElementById('csvInput').addEventListener('change', function() {
+  importCSVHandler(this.files);
+});
+
+// ===== START =====
+initScene();
+const mats = initPhysics();
+buildArena();
+buildFieldBarriers();
+buildTargetBoard();
+buildTrebuchet();
+buildTrail();
+const gui = initGUI();
+loadGLBModels();
+
+// Auto-load previous validation data + build target order
+buildTargetOrder();
+loadTraining();
+if (validator.sets.length > 0) {
+  const numResults = Object.keys(validator.results).length;
+  const validated = validator.validatedTargets.length;
+  if (numResults > 0) {
+    log(`Validation memory loaded: ${Object.values(validator.results).reduce((s, r) => s + r.total, 0)} trials across ${numResults} sets.`);
+    log(`Progress: Level ${validator.validationLevel} — ${validator.validatedTargets.filter(v => v.level === validator.validationLevel).length}/${validator.targetOrder.length} targets validated.`);
+    setStatus(`Loaded ${numResults} sets, ${validated} target validations. START to continue.`);
+  } else {
+    log(`Memory loaded: ${validator.sets.length} parameter sets ready for validation.`);
+    setStatus(`Loaded ${validator.sets.length} sets. Press START to validate.`);
+  }
+} else {
+  log('No saved validation data found. Load from Memory or Import CSV.');
+}
+
+animate();
+
+log('Validation Arena loaded. Load parameter sets and press START.');
+setStatus('Ready. Load parameter sets to validate.');
+
+console.log('Trebuchet Validation Arena loaded.');
+
+// Expose key objects on window so console paste-scripts can access them
+window.validator = validator;
+window.trainingData = trainingData;
+window.saveTraining = saveTraining;
+window.importCSVHandler = importCSVHandler;
+</script>
+</body>
+</html>

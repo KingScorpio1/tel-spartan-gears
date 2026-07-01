@@ -1,0 +1,2846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Baseball Trebuchet Arena Simulation</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #111; font-family: 'Segoe UI', Arial, sans-serif; }
+#info {
+  position: absolute; top: 20px; left: 20px; z-index: 10;
+  color: #fff; background: rgba(0,0,0,0.75); padding: 14px 20px;
+  border-radius: 8px; font-size: 14px; min-width: 260px;
+  pointer-events: none; border: 1px solid rgba(255,255,255,0.1);
+}
+#info .log-entry { color: #8cf; margin-top: 4px; font-size: 13px; }
+#info .log-entry.hit { color: #f66; font-weight: bold; }
+#info .status { color: #aaa; font-size: 12px; margin-top: 2px; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+
+<div id="info">
+  <div><strong>Baseball Trebuchet Simulator</strong>  <span id="score-display" style="float:right;color:#ffcc44;">Score: 0</span></div>
+  <div class="status" id="status-msg">Ready. Adjust parameters and press FIRE.</div>
+  <div id="log-container"></div>
+</div>
+
+<input type="file" id="csvInput" accept=".csv" style="display:none">
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/",
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as CANNON from 'cannon-es';
+import GUI from 'lil-gui';
+
+const RAD = Math.PI / 180;
+
+const config = {
+  posX: 0,
+  posZ: 2.5,
+  heading: 0,
+  pivotHeight: 1.0,
+  armMass: 4,
+  baseMass: 5,
+  motorTorque: 50,
+  leverLengthLoad: 1.0,
+  leverLengthCW: 0.5,
+  releaseAngle: 95,
+  modelScale: 0.001,
+  meshOffsetX: 0.026834891011241178,
+  meshOffsetY: -0.04495506623028258,
+  meshOffsetZ: 0.11745446247127002,
+  basePivotX: -0.23770602831864113,
+  basePivotY: 0.5103886551333617,
+  basePivotZ: 0.2807155949677642,
+  ballOffsetX: -1.0978787323707632e-9,
+  ballOffsetY: 0.1050171276281931,
+  ballOffsetZ: 0.6686593295498562,
+};
+
+const INITIAL_ARM_ANGLE = 45 * RAD;
+
+let scene, camera, renderer, controls;
+let world;
+let trebuchetGroup, boardGroup;
+let armMesh, ballMesh, armGroup, baseGroup, pivotDot, pivotDotOrange, pivotDotGreen, transformCtrl, gizmoTarget = 'Arm Pivot';
+let armBody, mountBody, ballBody;
+let hingeConstraint;
+let ballMat, wallMat;
+let trajectoryPoints = [];
+let trailLine, trailBuffer;
+const MAX_TRAIL = 800;
+let fired = false, released = false, landed = false, hasHit = false;
+let _stallFrames = 0;
+let score = 0;
+let boundingBox = null;
+let glbBase = null, glbArm = null;
+let _boardCrossY = null; // ball's Y when crossing z=7.5, for AI feedback
+let _boardCrossVx = null, _boardCrossVy = null, _boardCrossVz = null;
+let _lastHitProximity = 0, _lastHitQuality = '';
+const glbLoader = new GLTFLoader();
+const MODEL_PATH = './models/'; // placeholder path
+function loadGLBModels() {
+  glbLoader.load(MODEL_PATH + 'robot_base.glb', (gltf) => {
+    glbBase = gltf.scene;
+    glbBase.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    glbBase.rotation.x = Math.PI / 2;
+    glbBase.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    if (!fired && !AI.running) resetSim();
+  }, undefined, () => { glbBase = null; });
+  glbLoader.load(MODEL_PATH + 'robot_arm.glb', (gltf) => {
+    glbArm = gltf.scene;
+    glbArm.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    glbArm.rotation.x = -48 * RAD;
+    glbArm.rotation.z = -Math.PI / 2;
+    glbArm.rotation.y = Math.PI;
+    glbArm.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    if (!fired && !AI.running) resetSim();
+  }, undefined, () => { glbArm = null; });
+}
+let clock;
+let firedTime = 0;
+let firedWallTime = 0;
+let hitTargets = [];
+let targetIdCounter = 0;
+const statusMsg = document.getElementById('status-msg');
+const logContainer = document.getElementById('log-container');
+
+// Evolutionary AI: selects fittest params each generation, mutates them, runs indefinitely
+const AI = {
+  running: false,
+  popSize: 6,
+  eliteCount: 2,
+  trialsPerInd: 8,
+  mutationStd: 0.08,
+  population: [],
+  gen: 0,
+  idx: 0,
+  trial: 0,
+  hits: 0,
+  bestAccuracy: 0,
+  bestParams: null,
+  savedSets: [],
+  totalTrials: 0,
+  genHits: 0,
+  genTotal: 0,
+  prevGenAcc: null,
+  // Per-target progressive training
+  currentTargetIdx: 0,
+  targetOrder: [],
+  solvedTargets: [],
+  targetStats: {},
+};
+
+// Build target training order: center targets first (easier), edges next, bonus last
+function buildTargetOrder() {
+  // Score each target by distance from board center (0,0), bonus targets last
+  const scored = targetCircles.map(tc => {
+    const d = Math.sqrt(tc.data.x * tc.data.x + tc.data.y * tc.data.y);
+    const bonusPenalty = tc.data.type === 'bonus' ? 10 : 0;
+    return { id: tc.data.id, score: d + bonusPenalty };
+  });
+  scored.sort((a, b) => a.score - b.score);
+  AI.targetOrder = scored.map(s => s.id);
+  // Reset per-target tracking
+  AI.currentTargetIdx = 0;
+  AI.solvedTargets = [];
+  AI.targetStats = {};
+  for (const id of AI.targetOrder) {
+    AI.targetStats[id] = { hits: 0, total: 0, bestParams: null, bestAcc: 0 };
+  }
+}
+
+function currentTargetId() {
+  if (AI.currentTargetIdx >= AI.targetOrder.length) return 'ALL_DONE';
+  return AI.targetOrder[AI.currentTargetIdx] || null;
+}
+
+// Persistent training data (localStorage)
+const STORAGE_KEY = 'trebuchet_ai_training';
+let trainingData = { trials: [], bestAccuracy: 0, bestParams: null, savedSets: [], totalTrials: 0 };
+let trainingTrajectories = [];
+
+
+const FEASIBLE = {
+  posX: [-0.8, 0.8],
+  posZ: [1.5, 4.0],
+  heading: [-20, 20],
+  pivotHeight: [0.5, 1.5],
+  motorTorque: [5, 200],
+  leverLengthLoad: [0.4, 1.8],
+  leverLengthCW: [0.2, 1.0],
+  releaseAngle: [75, 115],
+};
+// Parameters the AI is NOT allowed to mutate (physical robot constraints)
+const FIXED_PARAMS = new Set(['pivotHeight', 'leverLengthLoad', 'leverLengthCW']);
+
+// ===== Target Board Geometry =====
+// Board is 3.0m × 3.4m, centered at (0, 1.7, 7.5). 12 holes in 3-column × 4-row layout.
+const BOARD = {
+  centerX: 0, centerY: 1.7, centerZ: 7.5,
+  halfW: 1.5, halfH: 1.7,
+  // Hole centers in world coordinates (y = localPos.y + centerY)
+  holes: [
+    // Standard holes (r=0.2) — 3 cols × 3 rows
+    { id: 't0', x: -0.9, y: 1.4, r: 0.2 },
+    { id: 't1', x:    0, y: 1.4, r: 0.2 },
+    { id: 't2', x:  0.9, y: 1.4, r: 0.2 },
+    { id: 't3', x: -0.9, y: 2.0, r: 0.2 },
+    { id: 't4', x:    0, y: 2.0, r: 0.2 },
+    { id: 't5', x:  0.9, y: 2.0, r: 0.2 },
+    { id: 't6', x: -0.9, y: 2.6, r: 0.2 },
+    { id: 't7', x:    0, y: 2.6, r: 0.2 },
+    { id: 't8', x:  0.9, y: 2.6, r: 0.2 },
+    // Bonus holes (r=0.1) — top row
+    { id: 't9',  x: -0.9, y: 3.15, r: 0.1 },
+    { id: 't10', x:    0, y: 3.15, r: 0.1 },
+    { id: 't11', x:  0.9, y: 3.15, r: 0.1 },
+  ],
+};
+function getTargetCenter(id) {
+  const h = BOARD.holes.find(h => h.id === id);
+  return h ? { x: h.x, y: h.y, z: BOARD.centerZ } : { x: 0, y: 0, z: 7.5 };
+}
+
+// ===== Parameter Space Learning (avoid low-accuracy regions) =====
+const PARAM_BINS = 10;
+const paramBinData = {}; // key: "paramName_binIndex" -> { hits, total }
+
+function paramBinKey(param, val) {
+  const [lo, hi] = FEASIBLE[param];
+  const bin = Math.min(Math.floor((val - lo) / (hi - lo) * PARAM_BINS), PARAM_BINS - 1);
+  return `${param}_${bin}`;
+}
+
+function recordParamBins(params, hit) {
+  for (const param of Object.keys(FEASIBLE)) {
+    const key = paramBinKey(param, params[param]);
+    if (!paramBinData[key]) paramBinData[key] = { hits: 0, total: 0 };
+    paramBinData[key].total++;
+    if (hit) paramBinData[key].hits++;
+  }
+}
+
+function paramAvoidancePenalty(params) {
+  let penalty = 0, count = 0;
+  for (const param of Object.keys(FEASIBLE)) {
+    const key = paramBinKey(param, params[param]);
+    const d = paramBinData[key];
+    if (d && d.total >= 5) {
+      const acc = d.hits / d.total;
+      if (acc < 0.6) {
+        penalty += (0.6 - acc);
+        count++;
+      }
+    }
+  }
+  return count > 0 ? (penalty / count) * 0.3 : 0;
+}
+
+function mutateParamsAvoid(params) {
+  // Mutate but re-roll any parameter that lands in a well-known bad bin
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const p = mutateParams(params);
+    let bad = false;
+    for (const param of Object.keys(FEASIBLE)) {
+      const key = paramBinKey(param, p[param]);
+      const d = paramBinData[key];
+      if (d && d.total >= 5 && d.hits / d.total < 0.6) { bad = true; break; }
+    }
+    if (!bad) return p;
+  }
+  return mutateParams(params); // fallback
+}
+
+function log(msg, isHit = false) {
+  const div = document.createElement('div');
+  div.className = 'log-entry' + (isHit ? ' hit' : '');
+  div.textContent = msg;
+  logContainer.appendChild(div);
+  if (logContainer.children.length > 50) logContainer.removeChild(logContainer.firstChild);
+}
+
+function setStatus(msg) { statusMsg.textContent = msg; }
+function updateScoreDisplay() { document.getElementById('score-display').textContent = `Score: ${score}`; }
+const TARGET_POINTS = { standard: 1, bonus: 3 };
+
+let targetCircles = [];
+
+function initScene() {
+  clock = new THREE.Clock();
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+  scene.fog = new THREE.Fog(0x1a1a2e, 25, 45);
+
+  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 60);
+  camera.position.set(8, 6, 10);
+  camera.lookAt(0, 1, 4);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.2;
+  document.body.appendChild(renderer.domElement);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.5, 4);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.maxPolarAngle = Math.PI / 2.05;
+  controls.update();
+
+  transformCtrl = new TransformControls(camera, renderer.domElement);
+  transformCtrl.setMode('translate');
+  transformCtrl.setSize(0.6);
+  transformCtrl.addEventListener('dragging-changed', e => { controls.enabled = !e.value; });
+  transformCtrl.addEventListener('change', () => {
+    if (transformCtrl.object === pivotDot && pivotDot && armMesh) {
+      config.meshOffsetX = pivotDot.position.x;
+      config.meshOffsetY = pivotDot.position.y;
+      config.meshOffsetZ = pivotDot.position.z;
+      armMesh.position.copy(pivotDot.position);
+    }
+    if (transformCtrl.object === pivotDotGreen && pivotDotGreen) {
+      config.ballOffsetX = pivotDotGreen.position.x;
+      config.ballOffsetY = pivotDotGreen.position.y;
+      config.ballOffsetZ = pivotDotGreen.position.z + config.leverLengthLoad;
+    }
+  });
+  transformCtrl.addEventListener('mouseUp', () => {
+    if (transformCtrl.object === pivotDotOrange && pivotDotOrange && baseGroup) {
+      const local = new THREE.Vector3();
+      baseGroup.worldToLocal(local.copy(pivotDotOrange.position));
+      config.basePivotX = local.x;
+      config.basePivotY = local.y;
+      config.basePivotZ = local.z;
+      if (!fired && !AI.running) resetSim();
+    }
+    if (transformCtrl.object === pivotDotGreen && pivotDotGreen && armGroup) {
+      config.ballOffsetX = pivotDotGreen.position.x;
+      config.ballOffsetY = pivotDotGreen.position.y;
+      config.ballOffsetZ = pivotDotGreen.position.z + config.leverLengthLoad;
+      if (!fired && !AI.running) resetSim();
+    }
+  });
+  scene.add(transformCtrl);
+
+  const ambient = new THREE.AmbientLight(0x404060, 0.6);
+  scene.add(ambient);
+
+  const hemi = new THREE.HemisphereLight(0x87ceeb, 0x362d1a, 0.8);
+  scene.add(hemi);
+
+  const sun = new THREE.DirectionalLight(0xffeedd, 2.2);
+  sun.position.set(10, 15, 5);
+  sun.castShadow = true;
+  sun.shadow.mapSize.width = 2048;
+  sun.shadow.mapSize.height = 2048;
+  sun.shadow.camera.near = 0.5;
+  sun.shadow.camera.far = 35;
+  sun.shadow.camera.left = -12;
+  sun.shadow.camera.right = 12;
+  sun.shadow.camera.top = 12;
+  sun.shadow.camera.bottom = -4;
+  scene.add(sun);
+
+  const fill = new THREE.DirectionalLight(0x8888ff, 0.4);
+  fill.position.set(-5, 3, -8);
+  scene.add(fill);
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+function initPhysics() {
+  world = new CANNON.World();
+  world.gravity.set(0, 0, 0);
+  world.broadphase = new CANNON.SAPBroadphase(world);
+  world.allowSleep = true;
+  world.solver.iterations = 20;
+
+  const groundMat = new CANNON.Material('ground');
+  ballMat = new CANNON.Material('ball');
+  wallMat = new CANNON.Material('wall');
+
+  const groundShape = new CANNON.Plane();
+  const groundBody = new CANNON.Body({ mass: 0, material: groundMat });
+  groundBody.addShape(groundShape);
+  groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+  world.addBody(groundBody);
+
+  world.addContactMaterial(new CANNON.ContactMaterial(ballMat, groundMat, {
+    friction: 0.4, restitution: 0.55,
+  }));
+  world.addContactMaterial(new CANNON.ContactMaterial(ballMat, wallMat, {
+    friction: 0.3, restitution: 0.5,
+  }));
+
+  return { ballMat, groundMat, wallMat };
+}
+
+function buildArena() {
+  const groundGeo = new THREE.PlaneGeometry(30, 40);
+  groundGeo.rotateX(-Math.PI / 2);
+  const groundMat = new THREE.MeshStandardMaterial({
+    color: 0x2a2a3a, roughness: 0.9, metalness: 0.0,
+  });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.receiveShadow = true;
+  ground.position.set(0, -0.01, 4);
+  scene.add(ground);
+
+  const gridHelper = new THREE.GridHelper(30, 30, 0x444466, 0x333355);
+  gridHelper.position.set(0, 0.001, 4);
+  scene.add(gridHelper);
+
+  // Robot Operation Zone
+  const zoneGeo = new THREE.PlaneGeometry(4, 5);
+  zoneGeo.rotateX(-Math.PI / 2);
+  const zoneMat = new THREE.MeshStandardMaterial({
+    color: 0x1a3a2a, transparent: true, opacity: 0.25,
+    roughness: 0.8, metalness: 0.0,
+  });
+  const zone = new THREE.Mesh(zoneGeo, zoneMat);
+  zone.position.set(0, 0.002, 2.5);
+  zone.receiveShadow = true;
+  scene.add(zone);
+
+  // Zone border
+  const borderMat = new THREE.LineBasicMaterial({ color: 0x44ff88, transparent: true, opacity: 0.5 });
+  const pts = [
+    [-2, 0], [2, 0], [2, 5], [-2, 5], [-2, 0]
+  ].map(([x, z]) => new THREE.Vector3(x, 0.005, z));
+  const borderGeo = new THREE.BufferGeometry().setFromPoints(pts);
+  const border = new THREE.Line(borderGeo, borderMat);
+  scene.add(border);
+
+  // Zone label
+  const canvas = document.createElement('canvas');
+  canvas.width = 256; canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  ctx.fillRect(0, 0, 256, 64);
+  ctx.fillStyle = '#44ff88';
+  ctx.font = 'bold 28px Arial';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('ROBOT ZONE', 128, 32);
+  const labelTex = new THREE.CanvasTexture(canvas);
+  const labelMat = new THREE.SpriteMaterial({ map: labelTex, transparent: true, opacity: 0.7 });
+  const label = new THREE.Sprite(labelMat);
+  label.position.set(0, 0.05, 2.5);
+  label.scale.set(2.5, 0.625, 1);
+  scene.add(label);
+
+  // Distance marker at 2.5m
+  const markerMat = new THREE.LineBasicMaterial({ color: 0xff8844, transparent: true, opacity: 0.3 });
+  const markerPts = [
+    new THREE.Vector3(-1.5, 0.003, 5),
+    new THREE.Vector3(1.5, 0.003, 5),
+  ];
+  const markerGeo = new THREE.BufferGeometry().setFromPoints(markerPts);
+  const marker = new THREE.Line(markerGeo, markerMat);
+  scene.add(marker);
+
+  // Floor dimension labels
+  function makeLabel(text, x, z, color, size) {
+    const c = document.createElement('canvas');
+    c.width = 128; c.height = 48;
+    const cx = c.getContext('2d');
+    cx.fillStyle = 'rgba(0,0,0,0.6)';
+    cx.fillRect(0, 0, 128, 48);
+    cx.fillStyle = color || '#888';
+    cx.font = 'bold 22px monospace';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(text, 64, 26);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const spr = new THREE.Sprite(mat);
+    spr.position.set(x, 0.03, z);
+    spr.scale.set(size || 0.6, (size || 0.6) * 0.375, 1);
+    scene.add(spr);
+  }
+  // Z-axis distance markers (meters from origin along launch direction)
+  for (let z = 0; z <= 8; z++) {
+    makeLabel(`${z}m`, -2.3, z, z === 7 ? '#ff8844' : '#666');
+  }
+  makeLabel('BOARD', -2.3, 7.5, '#ff8844');
+  // X-axis markers at board line
+  for (let x = -1.5; x <= 1.5; x += 0.5) {
+    makeLabel(x.toFixed(1), x, 7.8, '#666', 0.4);
+  }
+}
+
+function buildFieldBarriers() {
+  const HW = 2, D = 11, HC = 4, HWd = 0.5, T = 0.12;
+  // Robot zone: z=0–5, Target zone: z=5–11
+  // All barriers at field edges: x=±2, z=0, z=11
+
+  const woodMat = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.9 });
+  const canvasMat = new THREE.MeshPhysicalMaterial({
+    color: 0x88ddff, transparent: true, opacity: 0.12,
+    roughness: 0.1, side: THREE.DoubleSide, depthWrite: false,
+  });
+  const trussMat = new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.6, metalness: 0.3 });
+
+  function addBarrier(w, h, d, px, py, pz, mat, isCanvas) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    mesh.position.set(px, py, pz);
+    scene.add(mesh);
+    const body = new CANNON.Body({ mass: 0, material: wallMat });
+    body.addShape(new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)));
+    body.position.set(px, py, pz);
+    world.addBody(body);
+  }
+
+  // --- 1. Wood lower walls (Robot Zone only, z=0–5) ---
+  addBarrier(T, HWd, 5, -HW, HWd/2, 2.5, woodMat);   // left
+  addBarrier(T, HWd, 5,  HW, HWd/2, 2.5, woodMat);   // right
+  addBarrier(4, HWd, T, 0, HWd/2, -T/2, woodMat);      // rear at z=0
+  addBarrier(4, HWd, T, 0, HWd/2, 5, woodMat);         // mid at z=5 (zone boundary)
+
+  // --- 2. Canvas walls (full height, full field) ---
+  addBarrier(T, HC, D, -HW, HC/2, D/2, canvasMat, true);    // left
+  addBarrier(T, HC, D,  HW, HC/2, D/2, canvasMat, true);    // right
+  addBarrier(4, HC, T, 0, HWd + HC/2, -T/2, canvasMat, true);  // rear (above wood)
+  addBarrier(4, HC, T, 0, HC/2, D + T/2, canvasMat, true);  // front at z=11
+  addBarrier(4, T, D, 0, HC, D/2, canvasMat, true);         // ceiling at y=4
+
+  // --- 3. Truss pillars at 4 corners ---
+  const pillarH = HC, pillarW = 0.25;
+  const corners = [
+    [-HW, 0, 0], [HW, 0, 0], [-HW, 0, D], [HW, 0, D],
+  ];
+  for (const [cx, cy, cz] of corners) {
+    const pMesh = new THREE.Mesh(
+      new THREE.BoxGeometry(pillarW, pillarH, pillarW), trussMat
+    );
+    pMesh.position.set(cx, pillarH/2, cz);
+    scene.add(pMesh);
+    const pBody = new CANNON.Body({ mass: 0, material: wallMat });
+    pBody.addShape(new CANNON.Box(new CANNON.Vec3(pillarW/2, pillarH/2, pillarW/2)));
+    pBody.position.set(cx, pillarH/2, cz);
+    world.addBody(pBody);
+  }
+}
+
+function buildTargetBoard() {
+  boardGroup = new THREE.Group();
+  boardGroup.position.set(0, 1.7, 7.5);
+  // Vertical board (no rotation)
+  scene.add(boardGroup);
+
+  targetCircles = [];
+  hitTargets = [];
+  targetIdCounter = 0;
+
+  // Target positions — 3.0m × 3.4m board, origin at bottom-center on floor
+  const stdRadius = 0.2;
+  const bonusRadius = 0.1;
+  const positions = [];
+  // Local Y: worldY - 1.7 (board center Y)
+  const stdY = [-0.3, 0.3, 0.9];    // world: 1.4, 2.0, 2.6
+  const bonusY = [1.45];            // world: 3.15
+  const cols = [-0.9, 0, 0.9];
+
+  for (let y of stdY) {
+    for (let x of cols) {
+      positions.push({ id: `t${targetIdCounter++}`, x, y, r: stdRadius, type: 'standard', hit: false });
+    }
+  }
+  for (let y of bonusY) {
+    for (let x of cols) {
+      positions.push({ id: `t${targetIdCounter++}`, x, y, r: bonusRadius, type: 'bonus', hit: false });
+    }
+  }
+
+  // Board shape: 3.0w × 3.4h
+  const boardShape = new THREE.Shape();
+  boardShape.moveTo(-1.5, -1.7);
+  boardShape.lineTo(1.5, -1.7);
+  boardShape.lineTo(1.5, 1.7);
+  boardShape.lineTo(-1.5, 1.7);
+  boardShape.lineTo(-1.5, -1.7);
+
+  for (const p of positions) {
+    const hole = new THREE.Path();
+    const r = p.r;
+    const segs = 32;
+    for (let i = 0; i <= segs; i++) {
+      const theta = (i / segs) * Math.PI * 2;
+      const hx = p.x + r * Math.cos(theta);
+      const hy = p.y + r * Math.sin(theta);
+      if (i === 0) hole.moveTo(hx, hy);
+      else hole.lineTo(hx, hy);
+    }
+    boardShape.holes.push(hole);
+  }
+
+  const boardMat = new THREE.MeshStandardMaterial({
+    color: 0x2a2a4a, roughness: 0.6, metalness: 0.2,
+    side: THREE.DoubleSide,
+  });
+  const boardGeo = new THREE.ShapeGeometry(boardShape);
+  const board = new THREE.Mesh(boardGeo, boardMat);
+  board.position.z = -0.01;
+  boardGroup.add(board);
+
+  // Edge border
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0x6666aa });
+  const edgePts = [
+    [-1.5, -1.7, 0], [1.5, -1.7, 0], [1.5, 1.7, 0], [-1.5, 1.7, 0], [-1.5, -1.7, 0]
+  ].map(([x, y, z]) => new THREE.Vector3(x, y, z));
+  const edgeGeo = new THREE.BufferGeometry().setFromPoints(edgePts);
+  boardGroup.add(new THREE.Line(edgeGeo, edgeMat));
+
+  // Frame beams
+  const beamMat = new THREE.MeshStandardMaterial({ color: 0x555577, roughness: 0.7 });
+  boardGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.06, 3.4, 0.06), beamMat).translateX(-1.47).translateZ(0.05));
+  boardGroup.add(new THREE.Mesh(new THREE.BoxGeometry(0.06, 3.4, 0.06), beamMat).translateX(1.47).translateZ(0.05));
+  for (let y of [-0.52, 0.08, 0.68, 1.33]) {
+    boardGroup.add(new THREE.Mesh(new THREE.BoxGeometry(3.0, 0.04, 0.04), beamMat).translateY(y).translateZ(0.05));
+  }
+
+  // Target circle rings
+  const circleMatOn = new THREE.MeshStandardMaterial({
+    color: 0x44ff88, emissive: 0x22ff44, emissiveIntensity: 0.15,
+    side: THREE.DoubleSide, transparent: true, opacity: 0.8,
+  });
+  const circleMatOff = new THREE.MeshStandardMaterial({
+    color: 0x334455, emissive: 0x000000, emissiveIntensity: 0,
+    side: THREE.DoubleSide, transparent: true, opacity: 0.4,
+  });
+  const hitMat = new THREE.MeshStandardMaterial({
+    color: 0xff3333, emissive: 0xff0000, emissiveIntensity: 0.8,
+    side: THREE.DoubleSide, transparent: true, opacity: 0.95,
+  });
+
+  for (const p of positions) {
+    const mat = p.type === 'bonus' ? circleMatOn.clone() : circleMatOff.clone();
+    const g = new THREE.RingGeometry(p.r * 0.7, p.r * 1.05, 24);
+    const m = new THREE.Mesh(g, mat);
+    m.position.set(p.x, p.y, 0.001);
+    boardGroup.add(m);
+    targetCircles.push({ mesh: m, data: p, hitMat: hitMat.clone(), origMat: mat, boardGroup });
+  }
+
+  // Frame-shaped physics — full board with circular holes (vertical board)
+  // Uses overlapping strips to block all gaps between and around the 12 hole circles
+  const boardFrame = new CANNON.Body({ mass: 0, material: wallMat });
+  const BZ = 0.08;     // half thickness
+  const BH = 1.7;      // half board height
+  const BW = 1.48;     // half board width
+  // Reuse hole positions from above (stdY, bonusY, cols already declared)
+  const holes = [];
+  for (const y of stdY) for (const x of cols) holes.push({ x, y, r: 0.2 });
+  for (const y of bonusY) for (const x of cols) holes.push({ x, y, r: 0.1 });
+  // Vertical strips — block gaps between columns + outer edge gaps (full height)
+  const colGaps = [];
+  colGaps.push({ x: -1.3, w: 0.4 });   // left edge to left column
+  colGaps.push({ x: -0.45, w: 0.5 });   // left column to middle
+  colGaps.push({ x: 0.45, w: 0.5 });    // middle to right column
+  colGaps.push({ x: 1.3, w: 0.4 });     // right column to right edge
+  for (const g of colGaps) {
+    boardFrame.addShape(new CANNON.Box(new CANNON.Vec3(g.w / 2, BH, BZ)), new CANNON.Vec3(g.x, 0, 0));
+  }
+  // Horizontal strips — block gaps between rows (full width)
+  const rowGaps = [];
+  rowGaps.push({ y: -1.1, h: 1.2 });    // below bottom row
+  rowGaps.push({ y: 0, h: 0.2 });       // between bottom and middle
+  rowGaps.push({ y: 0.6, h: 0.2 });     // between middle and top
+  rowGaps.push({ y: 1.225, h: 0.25 });  // between top and bonus
+  rowGaps.push({ y: 1.625, h: 0.15 });  // above bonus row
+  for (const g of rowGaps) {
+    boardFrame.addShape(new CANNON.Box(new CANNON.Vec3(BW, g.h / 2, BZ)), new CANNON.Vec3(0, g.y, 0));
+  }
+  // Corner-filler boxes — block the rectilinear corners outside each hole circle
+  // A cell is 0.4×0.4m for standard holes, but the inscribed circle only has r=0.2.
+  // The triangular corner gaps are up to ~0.083m — enough for a 0.07m ball to pass through.
+  // Place 0.07m squares diagonally at each corner to close the gap.
+  const cornerSize = 0.07;
+  for (const h of holes) {
+    const d = h.r + cornerSize * 0.3; // offset from hole center toward each corner
+    for (let sx of [-1, 1]) {
+      for (let sy of [-1, 1]) {
+        boardFrame.addShape(
+          new CANNON.Box(new CANNON.Vec3(cornerSize / 2, cornerSize / 2, BZ)),
+          new CANNON.Vec3(h.x + sx * d, h.y + sy * d, 0)
+        );
+      }
+    }
+  }
+  boardFrame.position.set(0, 1.7, 7.58);
+  world.addBody(boardFrame);
+
+  // Catching Tubes behind each hole — longer, thicker walls, with end cap
+  const TUBE_LEN = 0.5;
+  const TUBE_THICK = 0.06;
+  const TUBE_ANGLE = 5 * RAD;
+  const tubeQuat = new CANNON.Quaternion();
+  tubeQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), TUBE_ANGLE);
+  for (const p of positions) {
+    const rTube = p.r * 0.85;
+    const hw = rTube;
+    const hh = rTube;
+    const wx = p.x;
+    const wy = p.y + 1.7;
+    const dY = -TUBE_LEN * Math.sin(TUBE_ANGLE);
+    const dZ = TUBE_LEN * Math.cos(TUBE_ANGLE);
+    const tubeBody = new CANNON.Body({ mass: 0, material: wallMat });
+    // Four walls
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, TUBE_THICK, TUBE_LEN)), new CANNON.Vec3(0, hh, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, TUBE_THICK, TUBE_LEN)), new CANNON.Vec3(0, -hh, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(TUBE_THICK, hh, TUBE_LEN)), new CANNON.Vec3(-hw, 0, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(TUBE_THICK, hh, TUBE_LEN)), new CANNON.Vec3(hw, 0, 0));
+    // End cap
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, hh, TUBE_THICK)), new CANNON.Vec3(0, 0, 0));
+    tubeBody.position.set(wx, wy + dY, 7.5 + dZ);
+    tubeBody.quaternion.copy(tubeQuat);
+    world.addBody(tubeBody);
+
+    // Visual tube (semi-transparent box with wireframe edges)
+    const tubeVisMat = new THREE.MeshPhysicalMaterial({
+      color: 0x88ddff, transparent: true, opacity: 0.15, roughness: 0.3, side: THREE.DoubleSide, depthWrite: false,
+    });
+    const tubeVis = new THREE.Mesh(new THREE.BoxGeometry(hw * 2, hh * 2, TUBE_LEN), tubeVisMat);
+    tubeVis.position.copy(tubeBody.position);
+    tubeVis.quaternion.copy(tubeBody.quaternion);
+    scene.add(tubeVis);
+    // Wireframe edge overlay
+    const edgeMat = new THREE.LineBasicMaterial({ color: 0x88ddff, transparent: true, opacity: 0.3 });
+    const edge = new THREE.LineSegments(new THREE.EdgesGeometry(tubeVis.geometry), edgeMat);
+    edge.position.copy(tubeVis.position);
+    edge.quaternion.copy(tubeVis.quaternion);
+    scene.add(edge);
+  }
+
+  // Y-axis labels on left side of board
+  function makeBoardLabel(text, y, color) {
+    const c = document.createElement('canvas');
+    c.width = 80; c.height = 36;
+    const cx = c.getContext('2d');
+    cx.fillStyle = 'rgba(0,0,0,0.5)';
+    cx.fillRect(0, 0, 80, 36);
+    cx.fillStyle = color || '#aaa';
+    cx.font = 'bold 16px monospace';
+    cx.textAlign = 'center';
+    cx.textBaseline = 'middle';
+    cx.fillText(text, 40, 18);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const spr = new THREE.Sprite(mat);
+    spr.position.set(-1.65, y, 7.5);
+    spr.scale.set(0.35, 0.16, 1);
+    scene.add(spr);
+  }
+  for (let y = 0; y <= 3.4; y += 0.5) {
+    const isHoleRow = [1.4, 2.0, 2.6, 3.15].some(h => Math.abs(h - y) < 0.01);
+    makeBoardLabel(y.toFixed(1), y, isHoleRow ? '#ff8844' : '#888');
+  }
+  makeBoardLabel('3.15★', 3.15, '#ffaa44');
+  makeBoardLabel('3.4', 3.4, '#888');
+}
+
+function buildTrebuchet() {
+  const h = config.heading * RAD;
+  const px = config.posX;
+  const pz = config.posZ;
+  const ph = config.pivotHeight;
+  const ll = config.leverLengthLoad;
+  const lc = config.leverLengthCW;
+
+  if (trebuchetGroup) {
+    scene.remove(trebuchetGroup);
+    trebuchetGroup = null;
+  }
+  trebuchetGroup = new THREE.Group();
+  scene.add(trebuchetGroup);
+
+  // Remove old physics
+  if (armBody) {
+    world.removeBody(armBody);
+    armBody = null;
+  }
+  if (mountBody) {
+    world.removeBody(mountBody);
+    mountBody = null;
+  }
+  if (ballBody) {
+    world.removeBody(ballBody);
+    ballBody = null;
+  }
+  if (hingeConstraint) { world.removeConstraint(hingeConstraint); hingeConstraint = null; }
+
+  if (ballMesh && ballMesh.parent) {
+    ballMesh.parent.remove(ballMesh);
+  }
+
+  // Bounding box wireframe (0.5 × 0.5 × 0.6m)
+  if (boundingBox) { scene.remove(boundingBox); boundingBox = null; }
+  const bbGeo = new THREE.BoxGeometry(0.5, 0.6, 0.5);
+  const bbMat = new THREE.MeshBasicMaterial({
+    color: 0x44ff44, wireframe: true, transparent: true, opacity: 0.3,
+  });
+  boundingBox = new THREE.LineSegments(new THREE.EdgesGeometry(bbGeo), new THREE.LineBasicMaterial({ color: 0x44ff44, transparent: true, opacity: 0.5 }));
+  boundingBox.position.set(px, 0.3, pz);
+  scene.add(boundingBox);
+
+  const dirX = Math.sin(h);
+  const dirZ = Math.cos(h);
+
+  // Base pivot world position (from baseGroup local offset + heading rotation)
+  const cosH = Math.cos(h);
+  const sinH = Math.sin(h);
+  const pivotX = px + config.basePivotX * cosH + config.basePivotZ * sinH;
+  const pivotY = config.basePivotY;
+  const pivotZ = pz - config.basePivotX * sinH + config.basePivotZ * cosH;
+
+  // ---- Physics bodies ----
+
+  // Mount (static, at fulcrum)
+  mountBody = new CANNON.Body({ mass: 0 });
+  mountBody.position.set(pivotX, pivotY, pivotZ);
+  const headingQuat = new CANNON.Quaternion();
+  headingQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
+  mountBody.quaternion.copy(headingQuat);
+  world.addBody(mountBody);
+
+  // Arm body (motor-driven, no separate counterweight)
+  armBody = new CANNON.Body({ mass: config.armMass });
+  armBody.addShape(new CANNON.Box(new CANNON.Vec3(0.025, 0.025, (ll + lc) / 2)));
+  armBody.position.set(pivotX, pivotY, pivotZ);
+
+  const tiltQuat = new CANNON.Quaternion();
+  tiltQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  armBody.quaternion = tiltQuat.mult(headingQuat);
+  armBody.sleepSpeedLimit = 0.1;
+  armBody.sleepTimeLimit = 0.5;
+  world.addBody(armBody);
+
+  // Hinge: motor holds arm cocked until fire, then drives forward
+  hingeConstraint = new CANNON.HingeConstraint(armBody, mountBody, {
+    pivotA: new CANNON.Vec3(0, 0, 0),
+    pivotB: new CANNON.Vec3(0, 0, 0),
+    axisA: new CANNON.Vec3(1, 0, 0),
+    axisB: new CANNON.Vec3(1, 0, 0),
+    motorEnabled: true,
+    motorSpeed: 0,
+    motorMaxForce: 10000,
+  });
+  world.addConstraint(hingeConstraint);
+
+  // Ball body — kinematic, follows arm tip + ball offset (catapult style)
+  const ballRadius = 0.035;
+  ballBody = new CANNON.Body({ mass: 0 });
+  ballBody.type = CANNON.Body.KINEMATIC;
+  ballBody.addShape(new CANNON.Sphere(ballRadius));
+  ballBody.ccdSpeedThreshold = 3;
+  ballBody.ccdRadius = ballRadius * 0.8;
+  const armTipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -ll + config.ballOffsetZ);
+  const armTipWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(armTipLocal, armTipWorld);
+  armTipWorld.vadd(armBody.position, armTipWorld);
+  ballBody.position.copy(armTipWorld);
+  world.addBody(ballBody);
+
+  // Catapult: ball sits at arm tip + ball offset, follows arm until release
+
+  // ---- Three.js visuals ----
+
+  // Group for base parts that rotate with heading
+  baseGroup = new THREE.Group();
+  baseGroup.position.set(px, 0, pz);
+  baseGroup.rotation.y = h;
+  trebuchetGroup.add(baseGroup);
+
+  // Arm wrapper group — synced to physics body; mesh offset within it for CAD calibration
+  armGroup = new THREE.Group();
+  trebuchetGroup.add(armGroup);
+
+  if (glbBase && glbArm) {
+    // Use loaded CAD models
+    const baseClone = glbBase.clone(true);
+    baseClone.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    baseGroup.add(baseClone);
+
+    armMesh = glbArm.clone(true);
+    armMesh.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    armMesh.castShadow = true;
+    armMesh.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+    armGroup.add(armMesh);
+
+
+  } else {
+    // Fallback: procedurally generated geometry
+    // Base platform
+    const baseMat = new THREE.MeshStandardMaterial({ color: 0x555566, roughness: 0.7, metalness: 0.3 });
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.08, 0.6), baseMat);
+    base.position.set(0, 0.04, 0);
+    base.castShadow = true;
+    baseGroup.add(base);
+
+    // Wheels
+    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+    for (let wz of [-0.25, 0.25]) {
+      for (let wx of [-0.28, 0.28]) {
+        const w = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.04, 12), wheelMat);
+        w.rotation.x = Math.PI / 2;
+        w.position.set(wx, 0.04, wz);
+        baseGroup.add(w);
+      }
+    }
+
+    // Upright support (two posts on sides of base)
+    const postMat = new THREE.MeshStandardMaterial({ color: 0x667788, roughness: 0.5, metalness: 0.4 });
+    for (let side of [-1, 1]) {
+      const post = new THREE.Mesh(new THREE.BoxGeometry(0.04, ph, 0.04), postMat);
+      post.position.set(side * 0.08, ph / 2, 0);
+      baseGroup.add(post);
+    }
+
+    // Lever arm (geometry offset so load arm extends in -Z, CW in +Z)
+    const armGeo = new THREE.BoxGeometry(0.03, 0.03, ll + lc);
+    armGeo.translate(0, 0, (lc - ll) / 2);
+    armMesh = new THREE.Mesh(
+      armGeo,
+      new THREE.MeshStandardMaterial({ color: 0x88aacc, roughness: 0.4, metalness: 0.5 })
+    );
+    armMesh.castShadow = true;
+    armMesh.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+    armGroup.add(armMesh);
+
+
+  }
+
+  // Pivot point visual (orange = physics fulcrum)
+  pivotDotOrange = new THREE.Mesh(
+    new THREE.SphereGeometry(0.03, 8, 8),
+    new THREE.MeshBasicMaterial({ color: 0xff8844 })
+  );
+  pivotDotOrange.position.set(pivotX, pivotY, pivotZ);
+  trebuchetGroup.add(pivotDotOrange);
+
+  // Blue dot = CAD mesh local origin (child of armGroup, offset = meshOffset)
+  const calDotMat = new THREE.MeshBasicMaterial({ color: 0x44aaff });
+  pivotDot = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), calDotMat);
+  pivotDot.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+  armGroup.add(pivotDot);
+
+  // Green dot = ball attachment point on arm tip (child of armGroup)
+  const ballDotMat = new THREE.MeshBasicMaterial({ color: 0x44ff44 });
+  pivotDotGreen = new THREE.Mesh(new THREE.SphereGeometry(0.025, 8, 8), ballDotMat);
+  pivotDotGreen.position.set(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+  armGroup.add(pivotDotGreen);
+
+  if (transformCtrl && transformCtrl.visible) {
+    const tgt = gizmoTarget === 'Base Pivot' ? pivotDotOrange : gizmoTarget === 'Ball Offset' ? pivotDotGreen : pivotDot;
+    if (tgt) transformCtrl.attach(tgt);
+  }
+
+  // Ball visual
+  ballMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(ballRadius, 16, 16),
+    new THREE.MeshStandardMaterial({ color: 0xeeeedd, roughness: 0.8, metalness: 0.0 })
+  );
+  ballMesh.castShadow = true;
+  trebuchetGroup.add(ballMesh);
+
+  // Heading arrow indicator
+  const arrowEnd = new THREE.Vector3(px + 0.3 * dirX, 0.1, pz + 0.3 * dirZ);
+  const arrowPts = [
+    new THREE.Vector3(px, 0.1, pz),
+    arrowEnd,
+  ];
+  const arrowGeo = new THREE.BufferGeometry().setFromPoints(arrowPts);
+  const arrowMat = new THREE.LineBasicMaterial({ color: 0x44aaff, transparent: true, opacity: 0.4 });
+  const arrowLine = new THREE.Line(arrowGeo, arrowMat);
+  trebuchetGroup.add(arrowLine);
+}
+
+function buildTrail() {
+  if (trailLine) {
+    scene.remove(trailLine);
+    trailLine.geometry.dispose();
+  }
+  trailBuffer = new Float32Array(MAX_TRAIL * 3);
+  const trailGeo = new THREE.BufferGeometry();
+  trailGeo.setAttribute('position', new THREE.BufferAttribute(trailBuffer, 3));
+  trailGeo.setDrawRange(0, 0);
+  const trailMat = new THREE.LineBasicMaterial({
+    color: 0x66ddff, transparent: true, opacity: 0.7,
+  });
+  trailLine = new THREE.Line(trailGeo, trailMat);
+  scene.add(trailLine);
+}
+
+function fireTrebuchet() {
+  if (fired) return;
+  const totalMass = config.armMass + config.baseMass;
+  if (totalMass > 30) {
+    setStatus(`Mass limit exceeded: ${totalMass.toFixed(1)}kg > 30kg`);
+    log(`⚠ Mass ${totalMass.toFixed(1)}kg exceeds 30kg limit`);
+    return;
+  }
+  fired = true;
+  released = false;
+  landed = false;
+  hasHit = false;
+  firedTime = clock.elapsedTime;
+  firedWallTime = Date.now();
+  trajectoryPoints = [];
+  _boardCrossY = null;
+  _boardCrossVx = null; _boardCrossVy = null; _boardCrossVz = null;
+  _lastHitProximity = 0; _lastHitQuality = '';
+
+  world.gravity.set(0, -9.82, 0);
+
+  if (armBody) {
+    armBody.wakeUp();
+    armBody.sleepSpeedLimit = -1;
+  }
+  // Engage motor to drive arm forward
+  if (hingeConstraint) {
+    hingeConstraint.enableMotor();
+    hingeConstraint.setMotorSpeed(30);
+    hingeConstraint.motorMaxForce = config.motorTorque;
+  }
+  if (ballBody) ballBody.wakeUp();
+
+  setStatus('Fired! Ball in flight...');
+  log('Trebuchet fired.');
+}
+
+function resetSim(keepLog = false) {
+  fired = false;
+  released = false;
+  landed = false;
+  hasHit = false;
+  firedTime = 0;
+  firedWallTime = 0;
+  trajectoryPoints = [];
+  hitTargets = [];
+  score = 0;
+  _stallFrames = 0;
+  updateScoreDisplay();
+
+  world.gravity.set(0, 0, 0);
+
+  // Reset target colors
+  for (const tc of targetCircles) {
+    tc.mesh.material.color.copy(tc.origMat.color);
+    tc.mesh.material.emissive.setHex(0x000000);
+    tc.mesh.material.emissiveIntensity = 0;
+    tc.data.hit = false;
+  }
+
+  buildTrebuchet();
+  buildTrail();
+
+  if (!keepLog) {
+    logContainer.innerHTML = '';
+    setStatus('Reset. Adjust parameters and press FIRE.');
+    log('Simulation reset.');
+  }
+}
+
+function updateCatapultBall() {
+  if (!armBody || !ballBody) return;
+  const tipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+  const tipWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(tipLocal, tipWorld);
+  tipWorld.vadd(armBody.position, tipWorld);
+  ballBody.position.copy(tipWorld);
+}
+
+function checkRelease() {
+  if (!fired || released || !armBody) return;
+
+  const h = config.heading * RAD;
+  const hingeAxis = new CANNON.Vec3(Math.cos(h), 0, -Math.sin(h));
+
+  // Initial load direction in world space (local -Z with initial tilt + heading)
+  const initQuat = new CANNON.Quaternion();
+  initQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  const headQuat = new CANNON.Quaternion();
+  headQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
+  const fullInit = initQuat.mult(headQuat);
+  const localDir = new CANNON.Vec3(0, 0, -1);
+  const initWorld = new CANNON.Vec3();
+  fullInit.vmult(localDir, initWorld);
+
+  // Current load direction in world space
+  const curWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(localDir, curWorld);
+
+  // Project both onto swing plane
+  function proj(v) {
+    const d = v.dot(hingeAxis);
+    return new CANNON.Vec3(v.x - d * hingeAxis.x, v.y - d * hingeAxis.y, v.z - d * hingeAxis.z);
+  }
+  const initP = proj(initWorld).unit();
+  const curP = proj(curWorld).unit();
+
+  // Signed rotation angle from initial position around hinge axis
+  const cross = new CANNON.Vec3();
+  initP.cross(curP, cross);
+  const angle = Math.atan2(cross.dot(hingeAxis), initP.dot(curP)) * (180 / Math.PI);
+
+  if (angle >= config.releaseAngle) {
+    released = true;
+    _stallFrames = 0;
+    // Kill motor so arm doesn't keep spinning
+    if (hingeConstraint) hingeConstraint.disableMotor();
+    // Catapult release: transfer arm tip velocity to ball
+    if (ballBody && armBody) {
+      const tipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+      const rWorld = new CANNON.Vec3();
+      armBody.vectorToWorldFrame(tipLocal, rWorld);
+      const tipVel = new CANNON.Vec3();
+      armBody.angularVelocity.cross(rWorld, tipVel);
+      tipVel.vadd(armBody.velocity, tipVel);
+      ballBody.velocity.copy(tipVel);
+      ballBody.type = CANNON.Body.DYNAMIC;
+      ballBody.mass = 0.03;
+      ballBody.updateMassProperties();
+      ballBody.wakeUp();
+    }
+    log(`Ball released at angle: ${angle.toFixed(1)}°`);
+    setStatus('Ball released!');
+  }
+}
+
+// Evaluate hole hit with deflection model
+function evaluateHoleHit(dist, dx, dy, rHole, vx, vy, vz) {
+  const R_BALL = 0.035;
+  if (dist <= rHole - R_BALL) {
+    const proximity = dist > 0 ? 1 - (dist / (rHole - R_BALL)) : 1;
+    return { hit: true, proximity, quality: 'clean', dist };
+  }
+  if (dist < rHole + R_BALL) {
+    if (vx != null && vy != null && vz != null) {
+      const nx = dx / dist, ny = dy / dist;
+      const vRadial = vx * nx + vy * ny;
+      const vTangMag = Math.abs(vx * (-ny) + vy * nx);
+      const vThrough = Math.abs(vz);
+      const restitution = 0.4;
+      const vRadialAfter = -restitution * vRadial;
+      const enters = vRadialAfter < 0 || (vTangMag > Math.abs(vRadialAfter) * 1.5 && vThrough > 1.0);
+      if (enters) {
+        const band = 2 * R_BALL;
+        const overlap = dist - (rHole - R_BALL);
+        const edgeProx = Math.max(0, 1 - overlap / band);
+        return { hit: true, proximity: edgeProx * 0.5, quality: 'deflect', dist };
+      }
+      return { hit: false, proximity: 0, quality: 'bounce', dist };
+    }
+    return { hit: dist < rHole - R_BALL * 0.5, proximity: 0, quality: 'uncertain', dist };
+  }
+  return { hit: false, proximity: 0, quality: 'miss', dist };
+}
+
+function checkTargetHit() {
+  if (!released || !ballBody || hasHit) return;
+
+  const ballPos = ballBody.position;
+  const bv = new THREE.Vector3(ballPos.x, ballPos.y, ballPos.z);
+  const localPos = new THREE.Vector3();
+  boardGroup.worldToLocal(localPos.copy(bv));
+
+  if (Math.abs(localPos.z) > 0.08) return;
+
+  for (const tc of targetCircles) {
+    if (tc.data.hit) continue;
+    const dx = localPos.x - tc.data.x;
+    const dy = localPos.y - tc.data.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const result = evaluateHoleHit(dist, dx, dy, tc.data.r, _boardCrossVx, _boardCrossVy, _boardCrossVz);
+
+    if (result.hit) {
+      tc.data.hit = true;
+      _lastHitProximity = result.proximity;
+      _lastHitQuality = result.quality;
+
+      if (result.quality === 'clean') {
+        tc.mesh.material.color.setHex(0x44ff88);
+        tc.mesh.material.emissive.setHex(0x22ff44);
+        tc.mesh.material.emissiveIntensity = 0.6;
+      } else {
+        tc.mesh.material.color.setHex(0xffaa22);
+        tc.mesh.material.emissive.setHex(0xff8800);
+        tc.mesh.material.emissiveIntensity = 0.8;
+      }
+      hitTargets.push(tc.data);
+      hasHit = true;
+      const pts = TARGET_POINTS[tc.data.type] || 1;
+      score += pts;
+      updateScoreDisplay();
+      const label = tc.data.type === 'bonus' ? 'BONUS' : 'Standard';
+      const proxStr = result.proximity > 0 ? ` (proximity: ${(result.proximity * 100).toFixed(0)}%)` : '';
+      log(`HIT ${label} target! [${result.quality}] +${pts} pts${proxStr}`, true);
+      setStatus(`Target hit! ${label} target! (Total: ${score} pts)`);
+    } else if (result.quality === 'bounce') {
+      tc.mesh.material.color.setHex(0xff6622);
+      tc.mesh.material.emissive.setHex(0xff4400);
+      tc.mesh.material.emissiveIntensity = 0.3;
+      setTimeout(() => {
+        tc.mesh.material.color.copy(tc.origMat.color);
+        tc.mesh.material.emissive.copy(tc.origMat.emissive);
+        tc.mesh.material.emissiveIntensity = tc.origMat.emissiveIntensity;
+      }, 200);
+    }
+  }
+}
+
+function checkLanding() {
+  if (!released || landed || !ballBody) return;
+
+  const pos = ballBody.position;
+  const wallElapsed = Date.now() - firedWallTime;
+  const vel = ballBody.velocity;
+  const settled = pos.y < 0.12 && vel.length() < 0.4 && wallElapsed > 1000;
+  if (pos.y < -0.5 || pos.y > 15 || Math.abs(pos.x) > 15 || pos.z > 25 || pos.z < -5 || wallElapsed > 5000 || settled) {
+    landed = true;
+    setStatus(`Ball landed. Final position: X=${pos.x.toFixed(3)}m, Z=${pos.z.toFixed(3)}m`);
+    log(`Landing: (${pos.x.toFixed(3)}, ${pos.z.toFixed(3)})`);
+
+    if (!hasHit) {
+      log('No target hit.');
+    }
+
+    // Evolutionary AI: record trial result
+    if (AI.running) {
+      AIrecordTrial(hasHit, { x: pos.x, z: pos.z });
+    }
+  }
+}
+
+// ===== Evolutionary AI System =====
+
+function rand(min, max) { return min + Math.random() * (max - min); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// Physics-based trajectory prediction (energy model)
+function launchVelocity(params) {
+  const g = 9.82, mp = 0.03, armM = config.armMass || 2;
+  const ll = params.leverLengthLoad, lc = params.leverLengthCW;
+  const totalLen = ll + lc;
+  const I = armM * totalLen * totalLen / 12 + mp * ll * ll;
+  const theta = params.releaseAngle * RAD;
+  const work = params.motorTorque * theta;
+  const omegaIdeal = Math.sqrt(2 * work / I);
+  const omega = Math.min(omegaIdeal, 30); // motor target speed cap
+  const v = omega * ll;
+  const launchRad = (135 - params.releaseAngle) * RAD;
+  return { v, launchRad, g };
+}
+
+function predictRange(params) {
+  const { v, launchRad, g } = launchVelocity(params);
+  const launchY = params.pivotHeight;
+  const vx = v * Math.cos(launchRad);
+  const vy = v * Math.sin(launchRad);
+  const disc = vy * vy + 2 * g * launchY;
+  if (disc < 0) return 0;
+  const t = (vy + Math.sqrt(disc)) / g;
+  return vx * t;
+}
+
+function predictHeight(params) {
+  const { v, launchRad, g } = launchVelocity(params);
+  const d = 7.5 - params.posZ;
+  if (d <= 0) return 0;
+  const cosR = Math.cos(launchRad);
+  if (cosR < 0.001) return 0;
+  const launchY = params.pivotHeight;
+  const y = launchY + d * Math.tan(launchRad) - g * d * d / (2 * v * v * cosR * cosR);
+  return y;
+}
+
+// ===== K-Nearest Neighbors (accelerates learning by leveraging all past trials) =====
+const KNN_MUTABLE = ['posX', 'posZ', 'heading', 'motorTorque', 'releaseAngle'];
+let knnData = [];
+
+function rebuildKNN() {
+  if (knnData.length === trainingData.trials.length) return;
+  knnData = [];
+  for (const t of trainingData.trials) {
+    if (t.p == null) continue;
+    const vec = {};
+    for (const param of KNN_MUTABLE) {
+      const [lo, hi] = FEASIBLE[param];
+      vec[param] = (t.p[param] - lo) / (hi - lo);
+    }
+    vec._hit = t.hit ? 1 : 0;
+    vec._landZ = t.landZ;
+    vec._landX = t.landX;
+    vec._boardY = t.boardY;
+    vec._targetId = t.currentTarget;
+    knnData.push(vec);
+  }
+}
+
+function knnDist(a, b) {
+  let sum = 0;
+  for (const param of KNN_MUTABLE) {
+    const d = a[param] - b[param];
+    sum += d * d;
+  }
+  return Math.sqrt(sum);
+}
+
+function knnQuery(params, targetId, k) {
+  if (knnData.length < 5) return null;
+  k = k || Math.min(8, Math.max(3, Math.floor(knnData.length / 3)));
+  const norm = {};
+  for (const param of KNN_MUTABLE) {
+    const [lo, hi] = FEASIBLE[param];
+    norm[param] = (params[param] - lo) / (hi - lo);
+  }
+  const dists = [];
+  const isSpecific = targetId != null && targetId !== 'ALL_DONE';
+  for (const d of knnData) {
+    if (!isSpecific || d._targetId === targetId) {
+      dists.push({ dist: knnDist(norm, d), data: d });
+    }
+  }
+  if (dists.length < 3) return null;
+  dists.sort((a, b) => a.dist - b.dist);
+  const neighbors = dists.slice(0, k);
+  const eps = 0.001;
+  let wSum = 0, hitSum = 0, dzSum = 0, dxSum = 0, dySum = 0;
+  let bestW = 0, bestVec = null;
+  for (const n of neighbors) {
+    const w = 1 / (n.dist + eps);
+    wSum += w;
+    if (n.data._hit != null) hitSum += n.data._hit * w;
+    if (n.data._landZ != null) dzSum += (n.data._landZ - 7.5) * w;
+    if (n.data._landX != null) dxSum += n.data._landX * w;
+    if (n.data._boardY != null) dySum += n.data._boardY * w;
+    if (w > bestW) { bestW = w; bestVec = n.data; }
+  }
+  const nearest = neighbors[0].dist;
+  return {
+    hitRate: hitSum / wSum,
+    avgDz: dzSum / wSum,
+    avgDx: dxSum / wSum,
+    avgDy: dySum / wSum,
+    confidence: Math.max(0, 1 - nearest * 2.5),
+    nearest,
+    bestParams: bestVec,
+  };
+}
+
+function knnRefine(params, targetId) {
+  const knn = knnQuery(params, targetId);
+  if (!knn || knn.confidence < 0.3) return params;
+  const p = { ...params };
+  const blend = knn.confidence * 0.3;
+  // Blend toward nearest high-performing neighbor in param space
+  if (knn.bestParams) {
+    const bp = {};
+    for (const param of KNN_MUTABLE) {
+      const [lo, hi] = FEASIBLE[param];
+      bp[param] = knn.bestParams[param] * (hi - lo) + lo;
+    }
+    for (const param of KNN_MUTABLE) {
+      p[param] = clamp(p[param] + (bp[param] - p[param]) * blend, ...FEASIBLE[param]);
+    }
+  }
+  return p;
+}
+
+function randomParams() {
+  // If KNN has data, bias random sampling toward high-hit-rate regions
+  if (knnData.length >= 10) {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const p = {
+        posX: rand(-0.5, 0.5),
+        posZ: rand(1.5, 3.5),
+        heading: rand(-10, 10),
+        pivotHeight: config.pivotHeight,
+        motorTorque: rand(15, 120),
+        leverLengthLoad: config.leverLengthLoad,
+        leverLengthCW: config.leverLengthCW,
+        releaseAngle: rand(80, 110),
+      };
+      const R = predictRange(p);
+      if (R < 3 || R > 25) continue;
+      const knn = knnQuery(p, currentTargetId());
+      if (knn && knn.hitRate > 0.3 && knn.confidence > 0.4) return p;
+    }
+  }
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const p = {
+      posX: rand(-0.5, 0.5),
+      posZ: rand(1.5, 3.5),
+      heading: rand(-10, 10),
+      pivotHeight: config.pivotHeight,
+      motorTorque: rand(15, 120),
+      leverLengthLoad: config.leverLengthLoad,
+      leverLengthCW: config.leverLengthCW,
+      releaseAngle: rand(80, 110),
+    };
+    const R = predictRange(p);
+    if (R > 3 && R < 25) return p;
+  }
+  return { posX:0, posZ:2.5, heading:0, pivotHeight:config.pivotHeight, motorTorque:50,
+    leverLengthLoad:config.leverLengthLoad, leverLengthCW:config.leverLengthCW, releaseAngle:95 };
+}
+
+function physicsScore(params) {
+  // How well does the physics model predict this will reach the current target?
+  const R = predictRange(params);
+  const tgtId = currentTargetId();
+  const tgt = tgtId && tgtId !== 'ALL_DONE' ? getTargetCenter(tgtId) : null;
+  const targetZ = tgt ? tgt.z : BOARD.centerZ;
+  const rangeScore = 1 - Math.abs(R - targetZ) / 5;
+  // Height prediction — reward params that put the ball at the right elevation
+  let heightScore = 0;
+  if (tgt) {
+    const hPred = predictHeight(params);
+    heightScore = Math.max(0, 1 - Math.abs(hPred - tgt.y) / 5);
+  }
+  return rangeScore * 0.6 + heightScore * 0.4;
+}
+
+function mutateParams(base) {
+  const s = AI.mutationStd;
+  const r = (v) => v * (1 + (Math.random() - 0.5) * 2 * s);
+  const p = {
+    posX: clamp(base.posX + (Math.random() - 0.5) * 0.2, ...FEASIBLE.posX),
+    posZ: clamp(base.posZ + (Math.random() - 0.5) * 0.4, ...FEASIBLE.posZ),
+    heading: clamp(base.heading + (Math.random() - 0.5) * 6, ...FEASIBLE.heading),
+    pivotHeight: base.pivotHeight,
+    motorTorque: clamp(r(base.motorTorque), ...FEASIBLE.motorTorque),
+    leverLengthLoad: base.leverLengthLoad,
+    leverLengthCW: base.leverLengthCW,
+    releaseAngle: clamp(base.releaseAngle + (Math.random() - 0.5) * 6, ...FEASIBLE.releaseAngle),
+  };
+  return p;
+}
+
+// Directional mutation: biases param changes based on how the ball missed the target
+// avgDz: average landing Z error (negative = undershot, positive = overshot)
+// avgDx: average landing X error (negative = left, positive = right)
+function mutateByError(base, avgDz, avgDx, avgDy) {
+  const p = { ...base };
+  const s = AI.mutationStd;
+  const hasDz = avgDz != null && isFinite(avgDz) && Math.abs(avgDz) > 0.05;
+  const hasDx = avgDx != null && isFinite(avgDx) && Math.abs(avgDx) > 0.05;
+  const hasDy = avgDy != null && isFinite(avgDy) && Math.abs(avgDy) > 0.05;
+
+  if (hasDz) {
+    const correction = clamp(avgDz * 0.025, -0.2, 0.2);
+    if (!FIXED_PARAMS.has('leverLengthCW')) p.leverLengthCW = clamp(p.leverLengthCW * (1 - correction), ...FEASIBLE.leverLengthCW);
+    if (!FIXED_PARAMS.has('leverLengthLoad')) p.leverLengthLoad = clamp(p.leverLengthLoad * (1 - correction * 0.7), ...FEASIBLE.leverLengthLoad);
+    p.motorTorque = clamp(p.motorTorque * (1 + correction * 0.5), ...FEASIBLE.motorTorque);
+    if (!FIXED_PARAMS.has('pivotHeight')) p.pivotHeight = clamp(p.pivotHeight * (1 - correction * 0.5), ...FEASIBLE.pivotHeight);
+    p.releaseAngle = clamp(p.releaseAngle + correction * 15, ...FEASIBLE.releaseAngle);
+  }
+  if (hasDx) {
+    const latCorrection = clamp(avgDx * 0.3, -2, 2);
+    p.heading = clamp(p.heading - latCorrection, ...FEASIBLE.heading);
+    p.posX = clamp(p.posX - avgDx * 0.08, ...FEASIBLE.posX);
+  }
+  if (hasDy) {
+    const vertCorrection = clamp(avgDy * 0.08, -0.25, 0.25);
+    p.releaseAngle = clamp(p.releaseAngle - vertCorrection * 20, ...FEASIBLE.releaseAngle);
+    if (!FIXED_PARAMS.has('pivotHeight')) p.pivotHeight = clamp(p.pivotHeight * (1 - vertCorrection * 0.4), ...FEASIBLE.pivotHeight);
+    p.motorTorque = clamp(p.motorTorque * (1 - vertCorrection * 0.3), ...FEASIBLE.motorTorque);
+  }
+
+  const halfS = s * 0.6;
+  const r = (v) => v * (1 + (Math.random() - 0.5) * 2 * halfS);
+  if (!FIXED_PARAMS.has('pivotHeight')) p.pivotHeight = clamp(r(p.pivotHeight), ...FEASIBLE.pivotHeight);
+  p.motorTorque = clamp(r(p.motorTorque), ...FEASIBLE.motorTorque);
+  if (!FIXED_PARAMS.has('leverLengthLoad')) p.leverLengthLoad = clamp(r(p.leverLengthLoad), ...FEASIBLE.leverLengthLoad);
+  if (!FIXED_PARAMS.has('leverLengthCW')) p.leverLengthCW = clamp(r(p.leverLengthCW), ...FEASIBLE.leverLengthCW);
+  p.heading = clamp(p.heading + (Math.random() - 0.5) * 2, ...FEASIBLE.heading);
+  p.releaseAngle = clamp(p.releaseAngle + (Math.random() - 0.5) * 3, ...FEASIBLE.releaseAngle);
+  p.posX = clamp(p.posX + (Math.random() - 0.5) * 0.08, ...FEASIBLE.posX);
+  p.posZ = clamp(p.posZ + (Math.random() - 0.5) * 0.12, ...FEASIBLE.posZ);
+  return p;
+}
+
+// Directional mutation + bin avoidance: applies directional correction then re-rolls bad bins
+function mutateByErrorWithAvoid(base, avgDz, avgDx, avgDy) {
+  for (let attempt = 0; attempt < 15; attempt++) {
+    const p = mutateByError(base, avgDz, avgDx, avgDy);
+    let bad = false;
+    for (const param of Object.keys(FEASIBLE)) {
+      const key = paramBinKey(param, p[param]);
+      const d = paramBinData[key];
+      if (d && d.total >= 5 && d.hits / d.total < 0.6) { bad = true; break; }
+    }
+    if (!bad) return p;
+  }
+  return mutateParamsAvoid(base); // fallback
+}
+
+// Small trial-level noise (different from evolution mutation)
+function trialNoise(base) {
+  return {
+    posX: base.posX + (Math.random() - 0.5) * 0.04,
+    posZ: base.posZ + (Math.random() - 0.5) * 0.06,
+    heading: base.heading + (Math.random() - 0.5) * 1.0,
+    pivotHeight: base.pivotHeight,
+    motorTorque: base.motorTorque * (1 + (Math.random() - 0.5) * 0.02),
+    leverLengthLoad: base.leverLengthLoad,
+    leverLengthCW: base.leverLengthCW,
+    releaseAngle: base.releaseAngle + (Math.random() - 0.5) * 1.0,
+  };
+}
+
+function noisyTrial(base) {
+  const p = trialNoise(base);
+  for (const param of FIXED_PARAMS) p[param] = config[param];
+  Object.assign(config, p);
+  resetSim(true);
+  fireTrebuchet();
+}
+
+// Early fail detection — abort obviously bad launches mid-flight
+function earlyFailCheck() {
+  if (!released || landed || !ballBody) return false;
+  const pos = ballBody.position;
+  const vel = ballBody.velocity;
+  const dz = pos.z - config.posZ; // how far forward from trebuchet
+  
+  // Going backward after release
+  if (dz < -0.5 && vel.z < -0.5) return true;
+  // Hit ground before reaching target zone
+  if (pos.y < 0.08 && dz < 2.5) return true;
+  // Way off to one side
+  if (Math.abs(pos.x) > 5.0) return true;
+  // Overshot — flew past the board way above it (never coming back)
+  if (pos.z > 10 && vel.z > 0) return true;
+  // Falling fast and still short of the target
+  if (vel.y < -6 && dz < 3.0 && pos.y < 0.5) return true;
+  // Bounced off ceiling and coming back down before reaching target
+  if (pos.y > 3.5 && vel.y < -1 && dz < 4.0) return true;
+  // Stalled — ball released but never left the launch zone
+  if (dz < 0.3) {
+    const speed = Math.sqrt(vel.x*vel.x + vel.y*vel.y + vel.z*vel.z);
+    if (speed < 0.8) {
+      _stallFrames++;
+      if (_stallFrames > 8) return true;
+    } else {
+      _stallFrames = Math.max(0, _stallFrames - 1);
+    }
+  } else {
+    _stallFrames = 0;
+  }
+  return false;
+}
+
+// ===== Training Persistence (localStorage + CSV) =====
+
+function saveTraining() {
+  const MAX_LOCAL_TRIALS = 5000;
+  const data = {
+    trials: trainingData.trials.slice(-MAX_LOCAL_TRIALS),
+    bestAccuracy: AI.bestAccuracy,
+    bestParams: AI.bestParams,
+    savedSets: AI.savedSets,
+    totalTrials: AI.totalTrials,
+    paramBinData: paramBinData,
+    currentTargetIdx: AI.currentTargetIdx,
+    solvedTargets: AI.solvedTargets,
+    targetStats: AI.targetStats,
+  };
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (e) {
+    // Quota exceeded — try with fewer trials
+    console.warn('localStorage quota exceeded, trimming trials');
+    data.trials = trainingData.trials.slice(-1000);
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+    } catch (e2) {
+      // Still fails — save minimal data
+      console.warn('localStorage still full, saving minimal data');
+      data.trials = [];
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }
+      catch (e3) { console.error('Cannot save to localStorage at all', e3); }
+    }
+  }
+}
+
+function resetTrainingData() {
+  localStorage.removeItem(STORAGE_KEY);
+  localStorage.removeItem('trebuchet_validation_results');
+  localStorage.removeItem('trebuchet_ai_training.validatedParams');
+  trainingData.trials = [];
+  trainingData.bestAccuracy = 0;
+  trainingData.bestParams = null;
+  trainingData.savedSets = [];
+  trainingData.totalTrials = 0;
+  AI.currentTargetIdx = 0;
+  AI.solvedTargets = [];
+  AI.targetStats = {};
+  AI.bestAccuracy = 0;
+  AI.bestParams = null;
+  AI.savedSets = [];
+  AI.totalTrials = 0;
+  for (const k in paramBinData) delete paramBinData[k];
+  log('All training data wiped. Starting fresh.');
+  setStatus('Data wiped. Ready.');
+}
+
+function loadTraining() {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (!raw) return;
+  try {
+    const d = JSON.parse(raw);
+    trainingData.trials = d.trials || [];
+    trainingData.bestAccuracy = d.bestAccuracy || 0;
+    trainingData.bestParams = d.bestParams || null;
+    trainingData.savedSets = d.savedSets || [];
+    trainingData.totalTrials = d.totalTrials || 0;
+    // Restore learned parameter-zone knowledge
+    if (d.paramBinData) {
+      Object.assign(paramBinData, d.paramBinData);
+    }
+    if (Object.keys(paramBinData).length === 0 && trainingData.trials.length > 0) {
+      for (const tr of trainingData.trials) {
+        recordParamBins(tr.p, tr.hit);
+      }
+    }
+    // Restore per-target training progress
+    if (d.currentTargetIdx != null) AI.currentTargetIdx = d.currentTargetIdx;
+    if (d.solvedTargets) AI.solvedTargets = d.solvedTargets;
+    if (d.targetStats) Object.assign(AI.targetStats, d.targetStats);
+  } catch (e) { /* ignore corrupt data */ }
+}
+
+function buildCSV() {
+  const header = 'gen,idx,trial,posX,posZ,heading,pivotHeight,motorTorque,leverLengthLoad,leverLengthCW,releaseAngle,hit,range_predicted,landX,landZ,targetId,currentTarget,hitCurrent,proximity,hitQuality';
+  const rows = trainingData.trials.map(t =>
+    `${t.gen},${t.idx},${t.trial},` +
+    `${t.p.posX.toFixed(4)},${t.p.posZ.toFixed(4)},${t.p.heading.toFixed(2)},` +
+    `${t.p.pivotHeight.toFixed(4)},${t.p.motorTorque.toFixed(2)},` +
+    `${t.p.leverLengthLoad.toFixed(4)},${t.p.leverLengthCW.toFixed(4)},` +
+    `${t.p.releaseAngle.toFixed(2)},` +
+    `${t.hit ? 1 : 0},${t.range.toFixed(2)},` +
+    `${t.landX != null ? t.landX.toFixed(4) : ''},${t.landZ != null ? t.landZ.toFixed(4) : ''},` +
+    `${t.targetId || ''},${t.currentTarget || ''},${t.hitCurrent ? 1 : 0},` +
+    `${t.proximity != null ? t.proximity.toFixed(4) : ''},${t.hitQuality || ''}`
+  );
+  return [header, ...rows].join('\n');
+}
+
+function sendCSV(csv, auto) {
+  fetch('/save-csv', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ csv, auto }),
+  }).then(r => r.json()).then(d => {
+    if (!auto) log(`CSV saved to server: ${d.filename}`);
+  }).catch((err) => {
+    if (auto) {
+      console.warn('Auto-save CSV failed — server not reachable. Open via http://localhost:8765', err.message);
+      return;
+    }
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `trebuchet_training_${Date.now()}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+  });
+}
+
+function autoExportCSV() {
+  const csv = buildCSV();
+  sendCSV(csv, true);
+}
+
+function exportCSV() {
+  const csv = buildCSV();
+  sendCSV(csv, false);
+}
+
+function importCSVHandler(files) {
+  if (!files.length) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    const lines = e.target.result.split('\n').filter(l => l.trim());
+    if (lines.length < 2) return;
+    // Skip header, parse each trial line
+    const trials = [];
+    for (let i = 1; i < lines.length; i++) {
+      const cols = lines[i].split(',');
+      if (cols.length < 14) continue;
+      trials.push({
+        gen: parseInt(cols[0]), idx: parseInt(cols[1]), trial: parseInt(cols[2]),
+        p: {
+          posX: parseFloat(cols[3]), posZ: parseFloat(cols[4]),
+          heading: parseFloat(cols[5]), pivotHeight: parseFloat(cols[6]),
+          motorTorque: parseFloat(cols[7]),
+          leverLengthLoad: parseFloat(cols[8]), leverLengthCW: parseFloat(cols[9]),
+          releaseAngle: parseFloat(cols[10]),
+        },
+        hit: cols[12] === '1',
+        range: parseFloat(cols[13]) || 0,
+        landX: cols[14] ? parseFloat(cols[14]) : null,
+        landZ: cols[15] ? parseFloat(cols[15]) : null,
+        targetId: cols[16] || null,
+        proximity: cols[18] ? parseFloat(cols[18]) : 0,
+        hitQuality: cols[19] || '',
+      });
+    }
+    // Find best params from imported data
+    let bestAcc = 0, bestP = null, saved = [];
+    const byParams = {};
+    for (const t of trials) {
+      const key = JSON.stringify(t.p);
+      if (!byParams[key]) byParams[key] = { params: t.p, hits: 0, total: 0 };
+      byParams[key].total++;
+      if (t.hit) byParams[key].hits++;
+    }
+    for (const key in byParams) {
+      const e = byParams[key];
+      const acc = e.hits / e.total;
+      if (acc > bestAcc) { bestAcc = acc; bestP = e.params; }
+      if (acc >= 0.8) saved.push({ params: e.params, fitness: acc });
+    }
+    // Restore into training data
+    trainingData.trials = trials;
+    trainingData.totalTrials = trials.length;
+    trainingData.bestAccuracy = bestAcc;
+    trainingData.bestParams = bestP;
+    trainingData.savedSets = saved;
+    AI.bestAccuracy = bestAcc;
+    AI.bestParams = bestP ? { ...bestP } : null;
+    AI.savedSets = saved.map(s => ({ params: { ...s.params }, fitness: s.fitness }));
+    AI.totalTrials = trials.length;
+    // Rebuild parameter-zone knowledge from all imported trials
+    for (const key in paramBinData) delete paramBinData[key];
+    for (const tr of trials) {
+      recordParamBins(tr.p, tr.hit);
+    }
+    const badBins = Object.values(paramBinData).filter(d => d.total >= 5 && d.hits / d.total < 0.6).length;
+    saveTraining();
+    log(`Imported ${trials.length} trials, ${saved.length} saved sets, best ${(bestAcc*100).toFixed(0)}%. Bad zones known: ${badBins}`);
+  };
+  reader.readAsText(files[0]);
+}
+
+// ===== End Persistence =====
+
+// ===== Diagnostics Chart =====
+
+const TARGET_DEFS = [];
+const TARGET_ROWS = 3, TARGET_COLS = 3;
+const TARGET_BOARD_WIDTH = 3.0, TARGET_BOARD_HEIGHT = 2.0;
+const TARGET_OFFSET_X = -1.0, TARGET_OFFSET_Y = 0.3;
+const TARGET_GAP_X = 1.2, TARGET_GAP_Y = 0.7;
+const TARGET_BOARD_Z = 7.5;
+for (let row = 0; row < TARGET_ROWS; row++) {
+  for (let col = 0; col < TARGET_COLS; col++) {
+    const isBonus = row === 0;
+    TARGET_DEFS.push({
+      x: TARGET_OFFSET_X + col * TARGET_GAP_X,
+      y: TARGET_OFFSET_Y + row * TARGET_GAP_Y,
+      r: isBonus ? 0.1 : 0.2,
+      bonus: isBonus,
+    });
+  }
+}
+
+let chartCanvas = null;
+let chartVisible = false;
+
+function showChart() {
+  if (!chartCanvas) {
+    chartCanvas = document.createElement('canvas');
+    chartCanvas.id = 'diag-chart';
+    chartCanvas.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:100;cursor:pointer;background:rgba(10,10,10,0.92);display:none';
+    document.body.appendChild(chartCanvas);
+    chartCanvas.addEventListener('click', hideChart);
+  }
+  chartVisible = true;
+  chartCanvas.style.display = 'block';
+  chartCanvas.width = window.innerWidth;
+  chartCanvas.height = window.innerHeight;
+  drawChart();
+}
+
+function hideChart() {
+  if (!chartCanvas) return;
+  chartVisible = false;
+  chartCanvas.style.display = 'none';
+}
+
+function drawChart() {
+  if (!chartCanvas || !chartVisible) return;
+  const c = chartCanvas.getContext('2d');
+  const W = chartCanvas.width, H = chartCanvas.height;
+
+  // Chart area (margins)
+  const ml = 80, mr = 40, mt = 60, mb = 50;
+  const cw = W - ml - mr, ch = H - mt - mb;
+
+  // World bounds to show
+  const zMin = 0, zMax = 12, xMin = -4, xMax = 4;
+
+  function toScreen(z, x) {
+    return [ ml + (z - zMin) / (zMax - zMin) * cw, mt + ch - (x - xMin) / (xMax - xMin) * ch ];
+  }
+
+  c.clearRect(0, 0, W, H);
+
+  // Background
+  c.fillStyle = '#1a1a2e';
+  c.fillRect(0, 0, W, H);
+
+  // Title
+  c.fillStyle = '#eee';
+  c.font = 'bold 20px monospace';
+  c.textAlign = 'center';
+  c.fillText('Landing Positions — Top View (Z→, X↔)', W/2, 30);
+
+  // Grid
+  c.strokeStyle = '#333';
+  c.lineWidth = 1;
+  for (let z = 0; z <= 12; z += 1) {
+    const [sx, sy] = toScreen(z, 0);
+    c.beginPath(); c.moveTo(sx, mt); c.lineTo(sx, H-mb); c.stroke();
+  }
+  for (let x = -4; x <= 4; x += 1) {
+    const [sx, sy] = toScreen(0, x);
+    c.beginPath(); c.moveTo(ml, sy); c.lineTo(W-mr, sy); c.stroke();
+  }
+
+  // Axis labels
+  c.fillStyle = '#888';
+  c.font = '11px monospace';
+  c.textAlign = 'center';
+  for (let z = 0; z <= 12; z += 2) {
+    const [sx, sy] = toScreen(z, xMin);
+    c.fillText(z+'m', sx, H - mb + 16);
+  }
+  c.textAlign = 'right';
+  for (let x = -4; x <= 4; x += 1) {
+    const [sx, sy] = toScreen(zMin, x);
+    c.fillText(x+'m', ml - 8, sy + 4);
+  }
+  c.textAlign = 'left';
+  c.fillStyle = '#666';
+  c.font = '10px monospace';
+  c.fillText('→ Z (range)', W - mr - 10, H - 10);
+  c.fillText('X (lateral) ↑', 8, mt + 12);
+
+  // Target board outline at z=7.5
+  const [bz1, by1] = toScreen(TARGET_BOARD_Z, -1.5);
+  const [bz2, by2] = toScreen(TARGET_BOARD_Z, 1.5);
+  c.strokeStyle = '#445';
+  c.lineWidth = 2;
+  c.setLineDash([4, 4]);
+  c.beginPath(); c.moveTo(bz1, by1); c.lineTo(bz2, by2); c.stroke();
+  c.setLineDash([]);
+
+  // Target circles
+  for (const t of TARGET_DEFS) {
+    const [cz, cx] = toScreen(TARGET_BOARD_Z, t.x);
+    const r = t.r / (zMax - zMin) * cw;
+    c.strokeStyle = t.bonus ? '#ff8844' : '#88aaff';
+    c.lineWidth = t.bonus ? 2 : 1.5;
+    c.beginPath();
+    c.arc(cz, cx, Math.max(r, 4), 0, Math.PI*2);
+    c.stroke();
+    if (t.bonus) {
+      c.fillStyle = 'rgba(255,136,68,0.08)';
+      c.beginPath(); c.arc(cz, cx, Math.max(r, 4), 0, Math.PI*2); c.fill();
+    }
+  }
+
+  // Per-target hit counts
+  const targetHitCounts = {};
+  for (const tr of trainingData.trials) {
+    if (tr.hit && tr.targetId) {
+      targetHitCounts[tr.targetId] = (targetHitCounts[tr.targetId] || 0) + 1;
+    }
+  }
+
+  // Legend
+  c.font = '12px monospace';
+  c.textAlign = 'left';
+  c.fillStyle = '#4c4';
+  c.fillRect(W - 170, 50, 10, 10);
+  c.fillText('Hit', W - 155, 60);
+  c.fillStyle = '#c44';
+  c.fillRect(W - 170, 68, 10, 10);
+  c.fillText('Miss', W - 155, 78);
+  c.fillStyle = '#ff4';
+  c.fillRect(W - 170, 86, 10, 10);
+  c.fillText('Early Fail', W - 155, 96);
+
+  // Stats
+  let total = trainingData.trials.length;
+  let hits = trainingData.trials.filter(t => t.hit).length;
+  let earlyFail = trainingData.trials.filter(t => t.hit === false && t.landX == null).length;
+  c.fillStyle = '#aaa';
+  c.font = '12px monospace';
+  c.textAlign = 'right';
+  c.fillText(`Trials: ${total}  Hits: ${hits} (${total ? (hits/total*100).toFixed(1) : 0}%)  Early Fail: ${earlyFail}`, W - 20, H - 16);
+
+  // Trend: compare last 2 generations' hit rate
+  let trendStr = '';
+  const gens = {};
+  for (const tr of trainingData.trials) {
+    if (!gens[tr.gen]) gens[tr.gen] = { hits: 0, total: 0 };
+    gens[tr.gen].total++;
+    if (tr.hit) gens[tr.gen].hits++;
+  }
+  const genNums = Object.keys(gens).map(Number).sort((a, b) => a - b);
+  if (genNums.length >= 2) {
+    const last = genNums[genNums.length - 1];
+    const prev = genNums[genNums.length - 2];
+    const gLast = gens[last], gPrev = gens[prev];
+    const aLast = gLast.total > 0 ? gLast.hits / gLast.total : 0;
+    const aPrev = gPrev.total > 0 ? gPrev.hits / gPrev.total : 0;
+    const delta = ((aLast - aPrev) * 100);
+    const sign = delta >= 0 ? '+' : '';
+    trendStr = `Gen ${prev}: ${(aPrev * 100).toFixed(1)}% → Gen ${last}: ${(aLast * 100).toFixed(1)}% (${sign}${delta.toFixed(1)}%)`;
+  }
+
+  // Per-target table (top-left) — shows hit counts + solved status
+  c.textAlign = 'left';
+  c.font = '11px monospace';
+  c.fillStyle = '#8af';
+  c.fillText('Targets', ml + 10, mt + 150);
+  c.font = '10px monospace';
+  let ty = mt + 166;
+  const order = AI.targetOrder.length > 0 ? AI.targetOrder : Object.keys(targetHitCounts).sort();
+  for (const tid of order) {
+    const n = targetHitCounts[tid] || 0;
+    const stats = AI.targetStats[tid] || {};
+    const total = stats.total || 0;
+    const hits = stats.hits || 0;
+    const acc = total > 0 ? (hits / total * 100).toFixed(0) : '-';
+    const solved = AI.solvedTargets.includes(tid);
+    const isCurrent = tid === currentTargetId();
+    const type = parseInt(tid.slice(1)) >= 9 ? 'bonus' : 'std';
+    if (solved) {
+      c.fillStyle = '#4c4';
+      c.fillText(`✓ ${tid} ${acc}%`, ml + 14, ty);
+    } else if (isCurrent) {
+      c.fillStyle = '#ff4';
+      c.fillText(`▶ ${tid} ${hits}/${total} (${acc}%)`, ml + 14, ty);
+    } else {
+      c.fillStyle = type === 'bonus' ? '#fa4' : '#8af';
+      c.fillText(`${tid} ${hits}/${total} (${acc}%)`, ml + 14, ty);
+    }
+    ty += 16;
+    if (ty > H - mb - 20) break;
+  }
+
+  // Trend indicator
+  if (trendStr) {
+    c.textAlign = 'left';
+    c.font = '11px monospace';
+    c.fillStyle = trendStr.includes('+') ? '#4c4' : trendStr.includes('-') ? '#c44' : '#aaa';
+    c.fillText(trendStr, ml + 10, mt + 130);
+  }
+
+  // Plot trials
+  for (const tr of trainingData.trials) {
+    const z = tr.landZ;
+    const x = tr.landX;
+    if (z == null || x == null) continue; // early fail or no landing pos
+    const [sx, sy] = toScreen(z, x);
+    if (sx < ml || sx > W-mr || sy < mt || sy > H-mb) continue;
+
+    c.fillStyle = tr.hit ? '#4c4' : '#c44';
+    c.beginPath();
+    c.arc(sx, sy, 3, 0, Math.PI*2);
+    c.fill();
+  }
+
+  // Early fail markers at edge
+  const efTrials = trainingData.trials.filter(t => t.hit === false && t.landX == null);
+  if (efTrials.length > 0) {
+    c.fillStyle = '#ff4';
+    c.font = '10px monospace';
+    c.textAlign = 'center';
+    c.fillText(`✕ ${efTrials.length} early fails`, ml + 60, mt + 14);
+    c.fillRect(ml + 10, mt + 8, 8, 8);
+  }
+
+  // Close hint
+  c.fillStyle = '#555';
+  c.font = '11px monospace';
+  c.textAlign = 'center';
+  c.fillText('Click anywhere to close', W/2, H - 8);
+}
+
+// ===== End Diagnostics =====
+
+// ===== 3D Trajectory Chart =====
+let traj3D = { renderer: null, scene: null, camera: null, controls: null, overlay: null, lines: [], animId: null };
+
+function showTrajectory3D() {
+  if (traj3D.overlay) { hideTrajectory3D(); return; }
+
+  if (trainingTrajectories.length === 0) { log('No trajectory data. Run AI training first.'); return; }
+
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;z-index:100;background:#111;display:flex;flex-direction:column;';
+  traj3D.overlay = overlay;
+
+  const filterBar = document.createElement('div');
+  filterBar.style.cssText = 'display:flex;align-items:center;gap:12px;padding:8px 16px;background:#1a1a2e;border-bottom:1px solid #333;font:12px monospace;color:#ccc;flex-shrink:0;';
+  filterBar.innerHTML = `<span style="color:#888">Trajectory 3D (${trainingTrajectories.length} paths, last 500)</span>`;
+  const filters = { hit: true, near: true, miss: true };
+  const counts = { hit: 0, near: 0, miss: 0 };
+  for (const t of trainingTrajectories) {
+    if (t.hit) counts.hit++;
+    else if (t.landZ != null && t.landZ > 6.5) counts.near++;
+    else counts.miss++;
+  }
+  for (const [cat, label, color] of [['hit','Hit','#4c4'],['near','Near Board','#cc4'],['miss','Miss','#c44']]) {
+    const chk = document.createElement('input');
+    chk.type = 'checkbox'; chk.checked = true;
+    chk.style.margin = '0 4px 0 8px';
+    const lbl = document.createElement('span');
+    lbl.style.color = color;
+    lbl.textContent = `${label} (${counts[cat]})`;
+    chk.addEventListener('change', () => { filters[cat] = chk.checked; rebuildTraj3D(); });
+    filterBar.appendChild(chk); filterBar.appendChild(lbl);
+  }
+  const closeBtn = document.createElement('button');
+  closeBtn.textContent = '✕ Close';
+  closeBtn.style.cssText = 'margin-left:auto;background:#333;border:1px solid #555;color:#eee;padding:3px 10px;border-radius:3px;cursor:pointer;font:11px monospace;';
+  closeBtn.onclick = hideTrajectory3D;
+  filterBar.appendChild(closeBtn);
+  overlay.appendChild(filterBar);
+
+  const container = document.createElement('div');
+  container.style.cssText = 'flex:1;position:relative;';
+  overlay.appendChild(container);
+  document.body.appendChild(overlay);
+
+  const W = container.clientWidth || window.innerWidth;
+  const H = container.clientHeight || window.innerHeight;
+  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+  renderer.setSize(W, H);
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  renderer.setClearColor(0x111122);
+  container.appendChild(renderer.domElement);
+  traj3D.renderer = renderer;
+
+  const scene = new THREE.Scene();
+  traj3D.scene = scene;
+
+  const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 50);
+  camera.position.set(6, 5, -4);
+  camera.lookAt(0, 1, 4);
+  traj3D.camera = camera;
+
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1, 4);
+  controls.update();
+  traj3D.controls = controls;
+
+  scene.add(new THREE.AmbientLight(0x404060));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.8);
+  dl.position.set(5, 10, 7);
+  scene.add(dl);
+  scene.add(new THREE.DirectionalLight(0xffffff, 0.3).position.set(-3, 5, -5));
+
+  const grid = new THREE.GridHelper(14, 14, 0x444466, 0x333355);
+  grid.position.y = -0.01;
+  scene.add(grid);
+
+  const axesLen = 0.8;
+  const makeArrow = (dir, color, label) => {
+    const arrow = new THREE.ArrowHelper(new THREE.Vector3(dir[0], dir[1], dir[2]), new THREE.Vector3(0, 0, 0), axesLen, color, 0.15, 0.1);
+    scene.add(arrow);
+  };
+  makeArrow([1,0,0], 0xff4444);
+  makeArrow([0,1,0], 0x44ff44);
+  makeArrow([0,0,1], 0x4444ff);
+
+  const boardGeo = new THREE.PlaneGeometry(3.0, 3.4);
+  const boardMat = new THREE.MeshBasicMaterial({ color: 0x4466aa, transparent: true, opacity: 0.08, side: THREE.DoubleSide, depthWrite: false });
+  const boardMesh = new THREE.Mesh(boardGeo, boardMat);
+  boardMesh.position.set(0, 1.7, 7.5);
+  scene.add(boardMesh);
+  const edgePts = [[-1.5,-1.7,0],[1.5,-1.7,0],[1.5,1.7,0],[-1.5,1.7,0],[-1.5,-1.7,0]].map(([x,y,z]) => new THREE.Vector3(x, y+1.7, z+7.5));
+  const edgeGeo2 = new THREE.BufferGeometry().setFromPoints(edgePts);
+  const edgeLine2 = new THREE.Line(edgeGeo2, new THREE.LineBasicMaterial({ color: 0x4466aa, transparent: true, opacity: 0.2 }));
+  scene.add(edgeLine2);
+
+  // Target hole rings
+  for (const h of BOARD.holes) {
+    const ringGeo = new THREE.RingGeometry(h.r * 0.6, h.r * 1.0, 24);
+    const ringMat = new THREE.MeshBasicMaterial({ color: 0x88dd88, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false });
+    const ring = new THREE.Mesh(ringGeo, ringMat);
+    ring.position.set(h.x, h.y, 7.5);
+    scene.add(ring);
+  }
+
+  const tretPts = [new THREE.Vector3(config.posX, 0, config.posZ), new THREE.Vector3(config.posX, 0.5, config.posZ)];
+  const tretGeo = new THREE.BufferGeometry().setFromPoints(tretPts);
+  scene.add(new THREE.Line(tretGeo, new THREE.LineBasicMaterial({ color: 0x888888 })));
+
+  traj3D.lines = [];
+  scene.userData.filters = filters;
+
+  function rebuildTraj3D() {
+    for (const l of traj3D.lines) { scene.remove(l); if (l.geometry) l.geometry.dispose(); if (l.material) l.material.dispose(); }
+    traj3D.lines = [];
+    const f = scene.userData.filters || { hit: true, near: true, miss: true };
+    for (const traj of trainingTrajectories) {
+      let cat = 'miss';
+      let color = 0xcc4444;
+      if (traj.hit) { cat = 'hit'; color = 0x44cc44; }
+      else if (traj.landZ != null && traj.landZ > 6.5) { cat = 'near'; color = 0xcccc44; }
+      if (!f[cat]) continue;
+      const pts = traj.points;
+      if (!pts || pts.length < 6) continue;
+      const vecs = [];
+      for (let i = 0; i < pts.length; i += 3) {
+        vecs.push(new THREE.Vector3(pts[i], pts[i + 1], pts[i + 2]));
+      }
+      const geo = new THREE.BufferGeometry().setFromPoints(vecs);
+      const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: traj.hit ? 0.9 : 0.35 });
+      const line = new THREE.Line(geo, mat);
+      scene.add(line);
+      traj3D.lines.push(line);
+    }
+  }
+  scene.userData.rebuild = rebuildTraj3D;
+  rebuildTraj3D();
+
+  function animateTraj() {
+    if (!traj3D.overlay) return;
+    traj3D.animId = requestAnimationFrame(animateTraj);
+    traj3D.controls.update();
+    traj3D.renderer.render(traj3D.scene, traj3D.camera);
+  }
+  animateTraj();
+
+  const onResize = () => {
+    const w = container.clientWidth, h = container.clientHeight;
+    if (w > 0 && h > 0) {
+      traj3D.camera.aspect = w / h;
+      traj3D.camera.updateProjectionMatrix();
+      traj3D.renderer.setSize(w, h);
+    }
+  };
+  window.addEventListener('resize', onResize);
+  traj3D._resizeHandler = onResize;
+}
+
+function hideTrajectory3D() {
+  if (traj3D.animId) { cancelAnimationFrame(traj3D.animId); traj3D.animId = null; }
+  if (traj3D._resizeHandler) { window.removeEventListener('resize', traj3D._resizeHandler); }
+  if (traj3D.renderer) { traj3D.renderer.dispose(); traj3D.renderer = null; }
+  if (traj3D.controls) { traj3D.controls.dispose(); traj3D.controls = null; }
+  if (traj3D.overlay) { traj3D.overlay.remove(); traj3D.overlay = null; }
+  traj3D.scene = null; traj3D.camera = null; traj3D.lines = [];
+}
+
+function rebuildTraj3D() {
+  if (traj3D.scene && traj3D.scene.userData.rebuild) traj3D.scene.userData.rebuild();
+}
+// ===== End 3D Trajectory Chart =====
+
+function AIinitPop() {
+  rebuildKNN();
+  AI.population = [];
+  for (let i = 0; i < AI.popSize; i++) {
+    // Seed with params whose predicted range is near the target board (z=7.5)
+    let params, bestR = Infinity;
+    for (let a = 0; a < 30; a++) {
+      const p = randomParams();
+      const R = predictRange(p);
+      const dist = Math.abs(R - 7.5);
+      if (dist < bestR) { bestR = dist; params = p; }
+      if (dist < 1.5) break; // close enough
+    }
+    const prior = physicsScore(params);
+    AI.population.push({ params, fitness: prior * 0.3, sumDz: 0, sumDx: 0, sumDy: 0, sumProx: 0, count: 0 });
+  }
+  AI.gen = 1;
+  AI.idx = 0;
+  AI.trial = 0;
+  AI.hits = 0;
+  AI.genHits = 0;
+  AI.genTotal = 0;
+  AI.prevGenAcc = null;
+}
+
+function AInextGen() {
+  // Sort by fitness descending
+  AI.population.sort((a, b) => b.fitness - a.fitness);
+  const next = AI.population.slice(0, AI.eliteCount).map(p => ({
+    params: { ...p.params }, fitness: 0, sumDz: 0, sumDx: 0, sumDy: 0, sumProx: 0, count: 0,
+  }));
+  while (next.length < AI.popSize) {
+    const parent = AI.population[Math.floor(Math.random() * AI.eliteCount)];
+    const parentAvgDz = parent.count > 0 ? parent.sumDz / parent.count : null;
+    const parentAvgDx = parent.count > 0 ? parent.sumDx / parent.count : null;
+    const parentAvgDy = parent.count > 0 ? parent.sumDy / parent.count : null;
+    const raw = mutateByErrorWithAvoid(parent.params, parentAvgDz, parentAvgDx, parentAvgDy);
+    const refined = knnRefine(raw, currentTargetId());
+    next.push({
+      params: refined,
+      fitness: 0, sumDz: 0, sumDx: 0, sumDy: 0, sumProx: 0, count: 0,
+    });
+  }
+  // Compute gen accuracy trend
+  const curGenAcc = AI.genTotal > 0 ? AI.genHits / AI.genTotal : 0;
+  const delta = AI.prevGenAcc != null ? ((curGenAcc - AI.prevGenAcc) * 100).toFixed(1) : null;
+  const deltaStr = delta != null ? `  (${delta >= 0 ? '+' : ''}${delta}% vs gen ${AI.gen})` : '';
+  AI.prevGenAcc = curGenAcc;
+
+  AI.population = next;
+  AI.gen++;
+  AI.idx = 0;
+  AI.trial = 0;
+  AI.hits = 0;
+  AI.genHits = 0;
+  AI.genTotal = 0;
+  const pct = (curGenAcc * 100).toFixed(1);
+  const best = AI.population[0];
+  let errLog = '';
+  if (best && best.count > 0) {
+    const dz = (best.sumDz / best.count).toFixed(2);
+    const dx = (best.sumDx / best.count).toFixed(2);
+    const dy = (best.sumDy / best.count).toFixed(2);
+    errLog = `  avgErr: dz=${dz} dx=${dx} dy=${dy}`;
+  }
+  const tgtId = currentTargetId();
+  const solved = AI.solvedTargets.length;
+  const totalTgts = AI.targetOrder.length;
+  log(`Gen ${AI.gen - 1} done. Target: ${tgtId} (${solved}/${totalTgts})  Best: ${(AI.bestAccuracy * 100).toFixed(1)}%  Saved: ${AI.savedSets.length}  Gen Acc: ${pct}%${deltaStr}${errLog}  Total: ${AI.totalTrials}`);
+}
+
+function AInextIndividual() {
+  const ind = AI.population[AI.idx];
+  AI.trial = 0;
+  AI.hits = 0;
+  noisyTrial(ind.params);
+  AI.trial++;
+  const bestPct = (AI.bestAccuracy * 100).toFixed(0);
+  const R = predictRange(ind.params).toFixed(1);
+  const errStr = ind.count > 0 ? `  dz=${(ind.sumDz/ind.count).toFixed(2)} dx=${(ind.sumDx/ind.count).toFixed(2)} dy=${(ind.sumDy/ind.count).toFixed(2)}` : '';
+  const tgt = currentTargetId();
+  const solved = AI.solvedTargets.length;
+  const total = AI.targetOrder.length;
+  setStatus(`[AI] ${tgt} (${solved}/${total} solved) G${AI.gen}/${AI.idx+1}/${AI.popSize}  R=${R}m${errStr}  Best: ${bestPct}%  Saved: ${AI.savedSets.length}`);
+}
+
+function AIstart(resume) {
+  AI.running = true;
+  rebuildKNN();
+  // Ensure target order is populated
+  if (AI.targetOrder.length === 0 && targetCircles.length > 0) buildTargetOrder();
+  const hasKnowledge = trainingData.totalTrials > 0 && trainingData.bestParams != null;
+
+  if (resume && hasKnowledge) {
+    // Resume from saved training data
+    AI.bestAccuracy = trainingData.bestAccuracy;
+    AI.bestParams = { ...trainingData.bestParams };
+    AI.savedSets = trainingData.savedSets.map(s => ({ ...s, params: { ...s.params } }));
+    AI.totalTrials = trainingData.totalTrials;
+    // Seed population from best saved params + mutations (with directional guidance)
+    AI.population = [];
+    const tgtId = currentTargetId();
+    for (let i = 0; i < AI.popSize; i++) {
+      if (i === 0 && AI.bestParams) {
+        AI.population.push({ params: { ...AI.bestParams }, fitness: AI.bestAccuracy, sumDz: 0, sumDx: 0, sumDy: 0, sumProx: 0, count: 0 });
+      } else {
+        const base = AI.bestParams ? mutateParamsAvoid(AI.bestParams) : randomParams();
+        const p = knnRefine(base, tgtId);
+        AI.population.push({ params: p, fitness: physicsScore(p) * 0.3, sumDz: 0, sumDx: 0, sumDy: 0, sumProx: 0, count: 0 });
+      }
+    }
+    AI.gen = Math.floor(AI.totalTrials / (AI.popSize * AI.trialsPerInd)) + 1;
+    const badBins = Object.values(paramBinData).filter(d => d.total >= 5 && d.hits / d.total < 0.6).length;
+    const tgt = currentTargetId();
+    const solved = AI.solvedTargets.length;
+    log(`=== Resumed: ${AI.totalTrials} trials, best ${(AI.bestAccuracy*100).toFixed(1)}%. ${solved}/${AI.targetOrder.length} targets solved. Current: ${tgt}. Bad zones: ${badBins} ===`);
+  } else {
+    // "Fresh" start but with accumulated parameter-zone knowledge
+    AI.bestAccuracy = hasKnowledge ? trainingData.bestAccuracy : 0;
+    AI.bestParams = hasKnowledge ? { ...trainingData.bestParams } : null;
+    AI.savedSets = hasKnowledge ? trainingData.savedSets.map(s => ({ ...s, params: { ...s.params } })) : [];
+    AI.totalTrials = trainingData.totalTrials || 0;
+    AI.population = [];
+    if (hasKnowledge) {
+      // Seed from best params; mutations use learned avoidance + KNN refinement
+      const tgtId = currentTargetId();
+      for (let i = 0; i < AI.popSize; i++) {
+        const base = i === 0 ? { ...AI.bestParams } : mutateParamsAvoid(AI.bestParams);
+        const p = knnRefine(base, tgtId);
+        AI.population.push({ params: p, fitness: physicsScore(p) * 0.3, sumDz: 0, sumDx: 0, sumDy: 0, sumProx: 0, count: 0 });
+      }
+    } else {
+      AIinitPop();
+    }
+    AI.gen = 1;
+    const badBins = Object.values(paramBinData).filter(d => d.total >= 5 && d.hits / d.total < 0.6).length;
+    const tgt = currentTargetId();
+    log(`=== AI started. Target: ${tgt} (0/${AI.targetOrder.length} solved). Memory: ${AI.totalTrials} past trials, ${badBins} bad zones known. ===`);
+  }
+  AI.idx = 0;
+  AI.trial = 0;
+  AI.hits = 0;
+  AInextIndividual();
+}
+
+function suggestToAI() {
+  const suggestion = {
+    posX: config.posX,
+    posZ: config.posZ,
+    heading: config.heading,
+    pivotHeight: config.pivotHeight,
+    motorTorque: config.motorTorque,
+    leverLengthLoad: config.leverLengthLoad,
+    leverLengthCW: config.leverLengthCW,
+    releaseAngle: config.releaseAngle,
+  };
+  // Ensure fixed params come from config, not current suggestion
+  for (const param of FIXED_PARAMS) suggestion[param] = config[param];
+  AI.bestParams = suggestion;
+  AI.bestAccuracy = 1.0;
+  trainingData.bestParams = { ...suggestion };
+  trainingData.bestAccuracy = 1.0;
+  // Re-seed population if AI is running
+  if (AI.running) {
+    AI.population = [];
+    const tgtId = currentTargetId();
+    for (let i = 0; i < AI.popSize; i++) {
+      const base = i === 0 ? { ...suggestion } : mutateParamsAvoid(suggestion);
+      const p = knnRefine(base, tgtId);
+      AI.population.push({ params: p, fitness: physicsScore(p) * 0.3, sumDz: 0, sumDx: 0, sumDy: 0, sumProx: 0, count: 0 });
+    }
+    AI.gen++;
+    AI.idx = 0;
+    AI.trial = 0;
+    AI.hits = 0;
+    saveTraining();
+    log(`📨 Suggested: ${JSON.stringify(suggestion)}`);
+    setStatus('Suggestion seeded into AI population.');
+  } else {
+    saveTraining();
+    log(`📨 Saved suggestion: ${JSON.stringify(suggestion)}`);
+    setStatus('Suggestion saved. It will be used when AI starts.');
+  }
+}
+
+function AIstop() {
+  AI.running = false;
+  const badBins = Object.values(paramBinData).filter(d => d.total >= 5 && d.hits / d.total < 0.6).length;
+  const solved = AI.solvedTargets.length;
+  const totalTgts = AI.targetOrder.length;
+  const tgt = currentTargetId();
+  if (AI.savedSets.length > 0) {
+    log(`AI stopped. Targets: ${solved}/${totalTgts}. Current: ${tgt}. ${AI.savedSets.length} sets saved. Bad zones: ${badBins}`);
+    log(`Best: ${(AI.bestAccuracy * 100).toFixed(1)}% — ${JSON.stringify(AI.bestParams)}`);
+  } else if (AI.bestParams) {
+    log(`AI stopped. Targets: ${solved}/${totalTgts}. Current: ${tgt}. Best: ${(AI.bestAccuracy * 100).toFixed(1)}%. Bad zones: ${badBins}`);
+  } else log(`AI stopped. Targets: ${solved}/${totalTgts}. Current: ${tgt}. Bad zones: ${badBins}`);
+  if (AI.bestParams) {
+    const savedFixed = {};
+    for (const param of FIXED_PARAMS) savedFixed[param] = config[param];
+    Object.assign(config, AI.bestParams);
+    for (const param of FIXED_PARAMS) if (savedFixed[param] !== undefined) config[param] = savedFixed[param];
+    resetSim(true);
+  }
+}
+
+function AIrecordTrial(hit, pos) {
+  const cur = AI.population[AI.idx];
+  const hitTargetId = hit && hitTargets.length > 0 ? hitTargets[0].id : null;
+  const targetId = currentTargetId();
+
+  // Check if the current target was hit specifically
+  const hitCurrent = hit && targetId != null && hitTargets.some(t => t.id === targetId);
+
+  // Track per-target stats globally (all targets, all time)
+  if (hitTargetId && AI.targetStats[hitTargetId]) {
+    AI.targetStats[hitTargetId].hits++;
+  }
+
+  const trialRec = {
+    gen: AI.gen, idx: AI.idx, trial: AI.trial,
+    p: { ...cur.params },
+    hit, range: predictRange(cur.params),
+    landX: pos ? pos.x : null, landZ: pos ? pos.z : null,
+    boardY: _boardCrossY,
+    proximity: _lastHitProximity,
+    hitQuality: _lastHitQuality,
+    targetId: hitTargetId,
+    currentTarget: targetId,
+    hitCurrent,
+  };
+  trainingData.trials.push(trialRec);
+  recordParamBins(cur.params, hit);
+  AI.totalTrials++;
+
+  // Save trajectory for 3D chart (downsampled)
+  if (trajectoryPoints.length > 0) {
+    const pts = trajectoryPoints;
+    const maxPts = 200;
+    const step = Math.max(3, Math.floor(pts.length / 3 / maxPts) * 3);
+    const sampled = [];
+    for (let i = 0; i < pts.length; i += step) {
+      if (i + 2 < pts.length) sampled.push(pts[i], pts[i + 1], pts[i + 2]);
+    }
+    trainingTrajectories.push({ points: sampled, hit: hitCurrent, targetId, landZ: pos ? pos.z : null });
+    // Keep last 500 trajectories
+    if (trainingTrajectories.length > 500) trainingTrajectories.splice(0, trainingTrajectories.length - 500);
+  }
+  trainingData.totalTrials = AI.totalTrials;
+  trainingData.bestAccuracy = AI.bestAccuracy;
+  trainingData.bestParams = AI.bestParams;
+  trainingData.savedSets = AI.savedSets;
+  saveTraining();
+  rebuildKNN();
+
+  // Accumulate trajectory error relative to the current target hole position
+  const tgtId = currentTargetId();
+  const tgtCenter = tgtId && tgtId !== 'ALL_DONE' ? getTargetCenter(tgtId) : null;
+  const tgtZ = tgtCenter ? tgtCenter.z : BOARD.centerZ;
+  const tgtX = tgtCenter ? tgtCenter.x : BOARD.centerX;
+  const tgtY = tgtCenter ? tgtCenter.y : BOARD.centerY;
+  if (pos && pos.z != null) { cur.sumDz += pos.z - tgtZ; cur.count++; }
+  if (pos && pos.x != null) { cur.sumDx += pos.x - tgtX; }
+  if (_boardCrossY != null) { cur.sumDy += _boardCrossY - tgtY; }
+  if (_lastHitProximity > 0) { cur.sumProx += _lastHitProximity; }
+
+  // Only count hits on current target for fitness
+  if (hitCurrent) { AI.hits++; AI.genHits++; }
+  AI.genTotal++;
+  // Also track per-target total
+  if (targetId && AI.targetStats[targetId]) AI.targetStats[targetId].total++;
+  const done = AI.trial >= AI.trialsPerInd;
+  if (!done) {
+    AI.trial++;
+    noisyTrial(cur.params);
+    const bestPct = (AI.bestAccuracy * 100).toFixed(0);
+    const R = predictRange(cur.params).toFixed(1);
+    const genAcc = AI.genTotal > 0 ? (AI.genHits / AI.genTotal * 100).toFixed(1) : '?';
+    const trend = AI.prevGenAcc != null
+      ? ((AI.genHits / AI.genTotal - AI.prevGenAcc) * 100).toFixed(1)
+      : null;
+    const trendStr = trend != null ? `  ${trend >= 0 ? '+' : ''}${trend}%` : '';
+    const errStr = cur.count > 0 ? `  dz=${(cur.sumDz/cur.count).toFixed(2)} dx=${(cur.sumDx/cur.count).toFixed(2)} dy=${(cur.sumDy/cur.count).toFixed(2)}` : '';
+    const proxStr = cur.count > 0 && cur.sumProx > 0 ? `  prox=${(cur.sumProx/cur.count*100).toFixed(0)}%` : '';
+    const tgt = currentTargetId();
+    const tgtStats = tgt && AI.targetStats[tgt];
+    const tgtStr = tgtStats ? `  ${tgt}:${tgtStats.hits}/${tgtStats.total}` : '';
+    setStatus(`[AI] ${tgt} G${AI.gen}/${AI.idx+1}/${AI.popSize}  T${AI.trial}/${AI.trialsPerInd}  R=${R}m  Best:${bestPct}%${errStr}${proxStr}  Saved:${AI.savedSets.length}${tgtStr}  GenAcc:${genAcc}%${trendStr}`);
+    return;
+  }
+  // Finished all trials for this individual
+  const simAcc = AI.hits / AI.trialsPerInd;
+  const phys = physicsScore(cur.params);
+  const avoid = paramAvoidancePenalty(cur.params);
+  // Trajectory accuracy: reward proximity to current target center (x, y, z)
+  let trajectoryAcc = 0;
+  if (cur.count > 0) {
+    const avgDz = cur.sumDz / cur.count;
+    const avgDx = cur.sumDx / cur.count;
+    const avgDy = cur.count > 0 && cur.sumDy !== 0 ? cur.sumDy / cur.count : 0;
+    const radialDist = Math.sqrt(avgDz * avgDz + avgDx * avgDx + avgDy * avgDy);
+    trajectoryAcc = Math.max(0, 1 - radialDist / 2.5);
+  }
+  // KNN confidence bonus: params near well-explored high-performing regions get a small boost
+  const knn = knnQuery(cur.params, currentTargetId());
+  const knnBonus = knn && knn.confidence > 0.4 ? knn.hitRate * knn.confidence * 0.05 : 0;
+  // Proximity bonus: extra reward for hits closer to hole center
+  const avgProx = cur.count > 0 && cur.sumProx > 0 ? cur.sumProx / cur.count : 0;
+  const proxBonus = avgProx * 0.1;
+  cur.fitness = simAcc * 0.55 + phys * 0.2 + trajectoryAcc * 0.25 - avoid + knnBonus + proxBonus;
+  const pct = (cur.fitness * 100).toFixed(0);
+
+  if (cur.fitness > AI.bestAccuracy) {
+    AI.bestAccuracy = cur.fitness;
+    AI.bestParams = { ...cur.params };
+    trainingData.bestAccuracy = AI.bestAccuracy;
+    trainingData.bestParams = AI.bestParams;
+    saveTraining();
+  }
+  if (cur.fitness >= 0.95) {
+    AI.savedSets.push({ params: { ...cur.params }, fitness: cur.fitness });
+    trainingData.savedSets = AI.savedSets;
+    saveTraining();
+    log(`✓ Saved #${AI.savedSets.length}: ${pct}% — ${JSON.stringify(cur.params)}`);
+  }
+
+  // Check if current target is solved (≥95% accuracy with ≥20 total trials)
+  const solvedTargetId = currentTargetId();
+  const tgt = solvedTargetId ? AI.targetStats[solvedTargetId] : null;
+  if (tgt && tgt.total >= 20) {
+    const acc = tgt.hits / tgt.total;
+    if (acc >= 0.95 && !AI.solvedTargets.includes(solvedTargetId)) {
+      AI.solvedTargets.push(solvedTargetId);
+      tgt.bestParams = { ...cur.params };
+      tgt.bestAcc = cur.fitness;
+      log(`=== TARGET ${solvedTargetId} SOLVED! Acc: ${(acc*100).toFixed(1)}% (${tgt.hits}/${tgt.total}) ===`);
+      // Advance to next unsolved target
+      AI.currentTargetIdx++;
+      while (AI.currentTargetIdx < AI.targetOrder.length && AI.solvedTargets.includes(AI.targetOrder[AI.currentTargetIdx])) {
+        AI.currentTargetIdx++;
+      }
+      if (AI.currentTargetIdx >= AI.targetOrder.length) {
+        log('=== ALL TARGETS SOLVED! ===');
+      } else {
+        log(`Now training for target: ${currentTargetId()}`);
+      }
+      saveTraining();
+    }
+  }
+
+  // Auto-save CSV to sim folder after each individual
+  autoExportCSV();
+
+  // Next individual or next generation
+  AI.idx++;
+  if (AI.idx >= AI.popSize) {
+    AInextGen();
+  }
+  AInextIndividual();
+}
+
+function syncPhysicsVisuals() {
+  if (!armBody || !trebuchetGroup) return;
+
+  // Sync arm wrapper group to physics body
+  armGroup.position.copy(armBody.position);
+  armGroup.quaternion.copy(armBody.quaternion);
+
+  // Sync ball mesh — follows ball body directly
+  if (ballBody && ballMesh) {
+    ballMesh.position.copy(ballBody.position);
+    ballMesh.quaternion.copy(ballBody.quaternion);
+  }
+
+  // Trajectory trail (fixed-size ring buffer)
+  if (released && ballBody) {
+    trajectoryPoints.push(
+      ballBody.position.x, ballBody.position.y, ballBody.position.z
+    );
+    const totalFloats = trajectoryPoints.length;
+    const count = Math.min(totalFloats / 3, MAX_TRAIL);
+    const skip = totalFloats > MAX_TRAIL * 3 ? totalFloats - MAX_TRAIL * 3 : 0;
+    for (let i = 0; i < count * 3; i++) {
+      trailBuffer[i] = trajectoryPoints[skip + i];
+    }
+    trailLine.geometry.attributes.position.needsUpdate = true;
+    trailLine.geometry.setDrawRange(0, count);
+  }
+}
+
+function animate() {
+  requestAnimationFrame(animate);
+
+  const dt = Math.min(clock.getDelta(), 0.033);
+
+  // Fast-forward: run multiple physics steps per frame when AI is training
+  const ffSteps = (AI.running && (fired || released)) ? 12 : 1;
+
+  for (let s = 0; s < ffSteps; s++) {
+    // Motor-driven arm: keep ball at arm tip before release
+    if (fired && !released && ballBody && armBody) updateCatapultBall();
+    if (world) world.step(1 / 60, 1 / 60, AI.running ? 3 : 1);
+    if (fired && !released) checkRelease();
+
+    if (released && !landed) {
+      // Track ball's Y when crossing the board plane (z ~ 7.5)
+      if (ballBody && _boardCrossY === null) {
+        const bz = ballBody.position.z;
+        if (bz >= BOARD.centerZ - 0.15 && bz <= BOARD.centerZ + 0.15) {
+          _boardCrossY = ballBody.position.y;
+          _boardCrossVx = ballBody.velocity.x;
+          _boardCrossVy = ballBody.velocity.y;
+          _boardCrossVz = ballBody.velocity.z;
+        }
+      }
+      if (AI.running && earlyFailCheck()) {
+        landed = true;
+        const p = ballBody.position;
+        AIrecordTrial(false, { x: p.x, z: p.z });
+        break;
+      }
+      checkTargetHit();
+      checkLanding();
+      if (landed) break; // AIrecordTrial may have started new trial
+    }
+    if (!fired) break; // resetSim was called, trial ended
+  }
+
+  syncPhysicsVisuals();
+  controls.update();
+  renderer.render(scene, camera);
+
+  // Catch up clock dt so next frame doesn't try to compensate
+  if (AI.running) clock.start();
+}
+
+// ===== GUI =====
+function initGUI() {
+  const gui = new GUI({ title: 'Trebuchet Controls', width: 300 });
+  gui.domElement.style.fontSize = '13px';
+
+  const posFolder = gui.addFolder('Position & Heading');
+  posFolder.add(config, 'posX', -1.8, 1.8, 0.01).name('Pos X (m)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  posFolder.add(config, 'posZ', 0.5, 4.5, 0.01).name('Pos Z (m)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  posFolder.add(config, 'heading', -180, 180, 1).name('Heading (deg)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  posFolder.open();
+
+  const mechFolder = gui.addFolder('Mechanism');
+  mechFolder.add(config, 'pivotHeight', 0.3, 2.0, 0.01).name('Pivot Height (m)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  mechFolder.add(config, 'leverLengthLoad', 0.3, 2.0, 0.01).name('Lever Load (m)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  mechFolder.add(config, 'leverLengthCW', 0.2, 1.5, 0.01).name('Lever CW (m)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  mechFolder.add(config, 'motorTorque', 5, 200, 0.5).name('Motor Torque (Nm)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  mechFolder.open();
+
+  const projFolder = gui.addFolder('Projectile & Release');
+  projFolder.add(config, 'releaseAngle', 30, 100, 1).name('Release Angle (°)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  projFolder.open();
+
+  const massFolder = gui.addFolder('Robot Mass (max 30kg)');
+  massFolder.add(config, 'armMass', 1, 15, 0.5).name('Arm Mass (kg)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+    updateMassReadout();
+  });
+  massFolder.add(config, 'baseMass', 1, 15, 0.5).name('Base Mass (kg)').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+    updateMassReadout();
+  });
+  const massState = { total: config.armMass + config.baseMass };
+  const massCtrl = massFolder.add(massState, 'total').name('⚖ Total (kg)').disable();
+  function updateMassReadout() {
+    const t = config.armMass + config.baseMass;
+    massState.total = t;
+    massCtrl.updateDisplay();
+  }
+  updateMassReadout();
+  massFolder.open();
+
+  // Evolutionary AI toggle
+  let aiMode = false;
+  const aiCtrl = {
+    'AI Mode': false,
+    START: () => { aiMode = true; aiCtrl['AI Mode'] = true; AIstart(false); },
+    RESUME: () => { aiMode = true; aiCtrl['AI Mode'] = true; AIstart(true); },
+    STOP: () => { aiMode = false; aiCtrl['AI Mode'] = false; AIstop(); },
+    'EXPORT CSV': () => exportCSV(),
+    'IMPORT CSV': () => document.getElementById('csvInput').click(),
+  };
+  const aiFolder = gui.addFolder(`Evolutionary AI — 0/12 targets`);
+  // Update the folder title dynamically
+  setInterval(() => {
+    if (AI.targetOrder.length > 0) {
+      const titleEl = aiFolder.domElement && aiFolder.domElement.querySelector('.title');
+      if (titleEl) titleEl.textContent = `Evolutionary AI — ${AI.solvedTargets.length}/${AI.targetOrder.length} targets`;
+    }
+  }, 2000);
+  aiFolder.add(aiCtrl, 'AI Mode').name('AI ⚡').onChange(v => {
+    if (v && !AI.running) { aiMode = true; AIstart(true); }
+    else if (!v && AI.running) { aiMode = false; AIstop(); }
+  });
+  aiFolder.add(aiCtrl, 'START').name('▶ Fresh Start');
+  aiFolder.add(aiCtrl, 'RESUME').name('↻ Resume Saved');
+  aiFolder.add(aiCtrl, 'STOP').name('■ STOP');
+  aiFolder.add(aiCtrl, 'EXPORT CSV').name('💾 Export CSV');
+  aiFolder.add(aiCtrl, 'IMPORT CSV').name('📂 Import CSV');
+  aiFolder.open();
+
+  const actions = {
+    FIRE: () => fireTrebuchet(),
+    RESET: () => resetSim(),
+    SUGGEST: () => suggestToAI(),
+    'Top View': () => {
+      camera.position.set(0, 12, 4);
+      controls.target.set(0, 0.5, 4);
+      controls.update();
+    },
+    'Side View': () => {
+      camera.position.set(12, 4, 4);
+      controls.target.set(0, 1, 4);
+      controls.update();
+    },
+  };
+  const actFolder = gui.addFolder('Actions');
+  actFolder.add(actions, 'FIRE').name('🔥 FIRE');
+  actFolder.add(actions, 'RESET').name('↺ RESET');
+  actFolder.add(actions, 'SUGGEST').name('📨 Suggest to AI');
+  actFolder.add(actions, 'Top View').name('Top View');
+  actFolder.add(actions, 'Side View').name('Side View');
+  actFolder.open();
+
+  const diagFolder = gui.addFolder('Diagnostics');
+  diagFolder.add({ 'Show Chart': () => showChart() }, 'Show Chart').name('📊 Show Chart');
+  diagFolder.add({ '3D Trajectory': () => showTrajectory3D() }, '3D Trajectory').name('🛤 3D Trajectories');
+  diagFolder.open();
+
+  const modelFolder = gui.addFolder('CAD Models');
+  modelFolder.add(config, 'modelScale', 0.001, 10, 0.001).name('Scale').onChange(() => {
+    if (!fired && !AI.running) resetSim();
+  });
+  modelFolder.add({ 'Reload Models': () => loadGLBModels() }, 'Reload Models').name('🔄 Reload');
+  modelFolder.add({ 'Wipe Training Data': () => resetTrainingData() }, 'Wipe Training Data').name('🗑 Wipe Data');
+  modelFolder.open();
+
+  const calFolder = gui.addFolder('Calibration (CAD Offset)');
+  calFolder.add(config, 'meshOffsetX', -2, 2, 0.01).name('Mesh Offset X').onChange(v => { if (armMesh) armMesh.position.x = v; });
+  calFolder.add(config, 'meshOffsetY', -2, 2, 0.01).name('Mesh Offset Y').onChange(v => { if (armMesh) armMesh.position.y = v; });
+  calFolder.add(config, 'meshOffsetZ', -2, 2, 0.01).name('Mesh Offset Z').onChange(v => { if (armMesh) armMesh.position.z = v; });
+  calFolder.add(config, 'basePivotX', -2, 2, 0.01).name('Base Pivot X').onChange(() => { if (!fired && !AI.running) resetSim(); });
+  calFolder.add(config, 'basePivotY', -2, 2, 0.01).name('Base Pivot Y').onChange(() => { if (!fired && !AI.running) resetSim(); });
+  calFolder.add(config, 'basePivotZ', -2, 2, 0.01).name('Base Pivot Z').onChange(() => { if (!fired && !AI.running) resetSim(); });
+  calFolder.add(config, 'ballOffsetX', -0.5, 0.5, 0.01).name('Ball Offset X').onChange(() => { if (!fired && !AI.running) resetSim(); });
+  calFolder.add(config, 'ballOffsetY', -0.5, 0.5, 0.01).name('Ball Offset Y').onChange(() => { if (!fired && !AI.running) resetSim(); });
+  calFolder.add(config, 'ballOffsetZ', -0.5, 0.5, 0.01).name('Ball Offset Z').onChange(() => { if (!fired && !AI.running) resetSim(); });
+  const gizmoState = { enabled: false, target: 'Arm Pivot' };
+  calFolder.add(gizmoState, 'enabled').name('🔧 3D Gizmo').onChange(v => {
+    if (!transformCtrl) return;
+    transformCtrl.visible = v;
+    if (!v) { transformCtrl.detach(); return; }
+    const tgt = gizmoState.target === 'Arm Pivot' ? pivotDot : gizmoState.target === 'Ball Offset' ? pivotDotGreen : pivotDotOrange;
+    if (tgt) transformCtrl.attach(tgt);
+  });
+  calFolder.add(gizmoState, 'target', ['Arm Pivot', 'Base Pivot', 'Ball Offset']).name('Target').onChange(v => {
+    gizmoTarget = v;
+    if (!transformCtrl || !transformCtrl.visible) return;
+    const tgt = v === 'Arm Pivot' ? pivotDot : v === 'Ball Offset' ? pivotDotGreen : pivotDotOrange;
+    if (tgt) transformCtrl.attach(tgt);
+  });
+  calFolder.open();
+
+  return gui;
+}
+
+// Bind file input in module scope
+document.getElementById('csvInput').addEventListener('change', function() {
+  importCSVHandler(this.files);
+});
+
+// ===== START =====
+initScene();
+const mats = initPhysics();
+buildArena();
+buildFieldBarriers();
+buildTargetBoard();
+buildTargetOrder();
+buildTrebuchet();
+buildTrail();
+const gui = initGUI();
+
+// Load CAD models asynchronously
+loadGLBModels();
+
+// Auto-load previous training data (including param-zone knowledge)
+loadTraining();
+if (trainingData.totalTrials > 0) {
+  AI.totalTrials = trainingData.totalTrials;
+  AI.bestAccuracy = trainingData.bestAccuracy;
+  AI.bestParams = trainingData.bestParams;
+  AI.savedSets = trainingData.savedSets;
+  const badBins = Object.values(paramBinData).filter(d => d.total >= 5 && d.hits / d.total < 0.6).length;
+
+  // Find the parameter set whose landings were closest to the target board (z=7.5)
+  let closestSet = null, closestDist = Infinity;
+  const byParams = {};
+  for (const tr of trainingData.trials) {
+    const key = JSON.stringify(tr.p);
+    if (!byParams[key]) { byParams[key] = { params: tr.p, landZ: [], count: 0 }; }
+    if (tr.landZ != null) { byParams[key].landZ.push(tr.landZ); }
+    byParams[key].count++;
+  }
+  for (const key in byParams) {
+    const e = byParams[key];
+    if (e.landZ.length === 0) continue;
+    // If any of this set's landings hit the target zone (z=5-11), consider it
+    const inZone = e.landZ.filter(z => z >= 5 && z <= 11);
+    if (inZone.length > 0) {
+      const avgZ = inZone.reduce((a, b) => a + b, 0) / inZone.length;
+      const dist = Math.abs(avgZ - 7.5);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closestSet = e.params;
+      }
+    }
+  }
+  // Prefer savedSets (≥95% accuracy) over closest-landing set
+  const bestConfig = trainingData.savedSets.length > 0
+    ? trainingData.savedSets[0].params
+    : (closestSet || trainingData.bestParams);
+  if (bestConfig) {
+    const savedFixed = {};
+    for (const param of FIXED_PARAMS) savedFixed[param] = config[param];
+    Object.assign(config, bestConfig);
+    // Preserve current fixed param values (user-set, AI can't change)
+    for (const param of FIXED_PARAMS) if (savedFixed[param] !== undefined) config[param] = savedFixed[param];
+    buildTrebuchet();
+  }
+
+  const tgt = currentTargetId();
+  log(`Memory loaded: ${trainingData.totalTrials} past trials, ${badBins} bad zones known. Best ${(trainingData.bestAccuracy*100).toFixed(1)}%. ${AI.solvedTargets.length}/${AI.targetOrder.length} targets solved.`);
+  setStatus(`Memory loaded: ${trainingData.totalTrials} trials. ${AI.solvedTargets.length}/${AI.targetOrder.length} targets solved. Current: ${tgt}. START or RESUME AI ⚡`);
+} else {
+  log('No memory found. Starting fresh.');
+}
+
+animate();
+
+log('Simulation loaded. Adjust parameters and press FIRE.');
+setStatus('Ready.');
+
+console.log('Baseball Trebuchet Arena Simulation loaded.');
+
+// Expose key objects on window so console paste-scripts can access them
+window.trainingData = trainingData;
+window.AI = AI;
+window.paramBinData = paramBinData;
+window.saveTraining = saveTraining;
+window.importCSVHandler = importCSVHandler;
+</script>
+</body>
+</html>
