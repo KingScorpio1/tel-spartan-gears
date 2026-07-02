@@ -34,9 +34,11 @@ Or double-click `start.bat` (training), `start_validate.bat` (validation), or `s
 |---|---|
 | **W** | Drive forward (increase posZ) |
 | **S** | Drive backward (decrease posZ) |
-| **A** | Rotate heading left |
-| **D** | Rotate heading right |
-| **↑ / ↓ / ← / →** | Arrow key equivalents for W/A/S/D |
+| **A** | Strafe left (decrease posX) |
+| **D** | Strafe right (increase posX) |
+| **Q** | Rotate heading left |
+| **E** | Rotate heading right |
+| **↑ / ↓ / ← / →** | Arrow key equivalents (forward/back/left/right strafe) |
 | **Space** | Fire trebuchet |
 | **R** | Reset simulation |
 | **Shift+T** | Top camera view |
@@ -48,8 +50,10 @@ Or double-click `start.bat` (training), `start_validate.bat` (validation), or `s
 |---|---|
 | **W / ↑** | Drive robot forward |
 | **S / ↓** | Drive robot backward |
-| **A / ←** | Rotate heading left |
-| **D / →** | Rotate heading right |
+| **A / ←** | Strafe left |
+| **D / →** | Strafe right |
+| **Q** | Rotate heading left |
+| **E** | Rotate heading right |
 | **Space** | Start match (WAITING) / Fire player robot (match) |
 | **R** | Full reset |
 | **Shift+T** | Top camera view |

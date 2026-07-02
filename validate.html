@@ -23,8 +23,8 @@ canvas { display: block; }
 
 <div id="info">
   <div><strong>Trebuchet Validation Arena</strong>  <span id="score-display" style="float:right;color:#ffcc44;">Score: 0</span></div>
-  <div class="status" id="status-msg">Ready. WASD/Arrows Position • Space Fire • R Reset</div>
-  <div class="sub" style="color:#666;font-size:11px;margin-top:2px;border-top:1px solid rgba(255,255,255,0.08);padding-top:3px;">WASD/Arrows Drive • Space Fire • R Reset • Shift+T Top • Shift+S Side</div>
+  <div class="status" id="status-msg">Ready. WASD Move • QE Rotate • Space Fire • R Reset</div>
+  <div class="sub" style="color:#666;font-size:11px;margin-top:2px;border-top:1px solid rgba(255,255,255,0.08);padding-top:3px;">WASD Move • QE Rotate • Space Fire • R Reset • Shift+T Top • Shift+S Side</div>
   <div id="log-container"></div>
 </div>
 
@@ -2588,12 +2588,14 @@ document.addEventListener('keydown', (e) => {
   // Position/heading adjustment (lowercase)
   if (key === 'w') { if (!fired) { config.posZ += 0.02; buildTrebuchet(); } }
   else if (key === 's') { if (!fired) { config.posZ -= 0.02; buildTrebuchet(); } }
-  else if (key === 'a') { if (!fired) { config.heading -= 1; buildTrebuchet(); } }
-  else if (key === 'd') { if (!fired) { config.heading += 1; buildTrebuchet(); } }
+  else if (key === 'a') { if (!fired) { config.posX -= 0.02; buildTrebuchet(); } }
+  else if (key === 'd') { if (!fired) { config.posX += 0.02; buildTrebuchet(); } }
+  else if (key === 'q') { if (!fired) { config.heading -= 1; buildTrebuchet(); } }
+  else if (key === 'e') { if (!fired) { config.heading += 1; buildTrebuchet(); } }
   else if (key === 'ArrowUp') { if (!fired) { config.posZ += 0.02; buildTrebuchet(); } }
   else if (key === 'ArrowDown') { if (!fired) { config.posZ -= 0.02; buildTrebuchet(); } }
-  else if (key === 'ArrowLeft') { if (!fired) { config.heading -= 1; buildTrebuchet(); } }
-  else if (key === 'ArrowRight') { if (!fired) { config.heading += 1; buildTrebuchet(); } }
+  else if (key === 'ArrowLeft') { if (!fired) { config.posX -= 0.02; buildTrebuchet(); } }
+  else if (key === 'ArrowRight') { if (!fired) { config.posX += 0.02; buildTrebuchet(); } }
   else if (key === ' ' || key === 'Space') { e.preventDefault(); fireTrebuchet(); }
   else if (key === 'r' || key === 'R') { if (!fired) resetSim(); }
   // View shortcuts (uppercase = Shift+key)
@@ -2607,7 +2609,7 @@ document.addEventListener('keydown', (e) => {
 
 animate();
 
-log('Validation Arena loaded. WASD/Arrows drive • Space Fire • R Reset • Shift+T Top • Shift+S Side');
+log('Validation Arena loaded. WASD Move • QE Rotate • Space Fire • R Reset • Shift+T Top • Shift+S Side');
 setStatus('Ready. WASD Position, Space Fire, R Reset');
 
 console.log('Trebuchet Validation Arena loaded.');
