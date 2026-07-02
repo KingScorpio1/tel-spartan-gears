@@ -62,7 +62,7 @@ canvas { display: block; }
     <div class="phase waiting" id="phase-text">WAITING</div>
     <div class="timer" id="timer-display">--:--</div>
     <div class="sub" id="status-msg">Ready.</div>
-    <div class="sub" style="color:#888;font-size:11px;margin-top:2px;">WASD Drive • Space Start/Fire • R Reset • T/S/1 Views</div>
+    <div class="sub" style="color:#888;font-size:11px;margin-top:2px;">WASD Drive • Space Start/Fire • R Reset • Shift+T Top • Shift+S Side • 1 Default</div>
     <div id="log-container" style="margin-top:8px;max-height:120px;overflow-y:auto;pointer-events:auto;font-size:12px;color:#8cf;"></div>
   </div>
   <div id="hud-right">
@@ -1635,10 +1635,11 @@ document.addEventListener('keydown', (e) => {
     }
   }
   else if (key === 'r' || key === 'R') { fullReset(); }
-  else if ((key === 't' || key === 'T') && !e.ctrlKey && !e.metaKey) {
+  // View shortcuts (uppercase = Shift+key to avoid WASD conflict)
+  else if (key === 'T') {
     camera.position.set(0, 12, 4); controls.target.set(0, 0.5, 4); controls.update();
   }
-  else if (key === 's' || key === 'S') {
+  else if (key === 'S') {
     camera.position.set(12, 4, 4); controls.target.set(0, 1, 4); controls.update();
   }
   else if (key === '1') {

@@ -23,8 +23,8 @@ canvas { display: block; }
 
 <div id="info">
   <div><strong>Trebuchet Validation Arena</strong>  <span id="score-display" style="float:right;color:#ffcc44;">Score: 0</span></div>
-  <div class="status" id="status-msg">Ready. [Space] Fire • [R] Reset • [T] Top • [S] Side</div>
-  <div class="sub" style="color:#666;font-size:11px;margin-top:2px;border-top:1px solid rgba(255,255,255,0.08);padding-top:3px;">Keyboard: Space Fire • R Reset • T Top • S Side</div>
+  <div class="status" id="status-msg">Ready. WASD/Arrows Position • Space Fire • R Reset</div>
+  <div class="sub" style="color:#666;font-size:11px;margin-top:2px;border-top:1px solid rgba(255,255,255,0.08);padding-top:3px;">WASD/Arrows Drive • Space Fire • R Reset • Shift+T Top • Shift+S Side</div>
   <div id="log-container"></div>
 </div>
 
@@ -2584,20 +2584,31 @@ if (validator.sets.length > 0) {
 // ===== Keyboard Controls =====
 document.addEventListener('keydown', (e) => {
   const key = e.key;
-  if (key === ' ' || key === 'Space') { e.preventDefault(); fireTrebuchet(); }
+
+  // Position/heading adjustment (lowercase)
+  if (key === 'w') { if (!fired) { config.posZ += 0.02; buildTrebuchet(); } }
+  else if (key === 's') { if (!fired) { config.posZ -= 0.02; buildTrebuchet(); } }
+  else if (key === 'a') { if (!fired) { config.heading -= 1; buildTrebuchet(); } }
+  else if (key === 'd') { if (!fired) { config.heading += 1; buildTrebuchet(); } }
+  else if (key === 'ArrowUp') { if (!fired) { config.posZ += 0.02; buildTrebuchet(); } }
+  else if (key === 'ArrowDown') { if (!fired) { config.posZ -= 0.02; buildTrebuchet(); } }
+  else if (key === 'ArrowLeft') { if (!fired) { config.heading -= 1; buildTrebuchet(); } }
+  else if (key === 'ArrowRight') { if (!fired) { config.heading += 1; buildTrebuchet(); } }
+  else if (key === ' ' || key === 'Space') { e.preventDefault(); fireTrebuchet(); }
   else if (key === 'r' || key === 'R') { if (!fired) resetSim(); }
-  else if ((key === 't' || key === 'T') && !e.ctrlKey && !e.metaKey) {
+  // View shortcuts (uppercase = Shift+key)
+  else if (key === 'T') {
     camera.position.set(0, 12, 4); controls.target.set(0, 0.5, 4); controls.update();
   }
-  else if (key === 's' || key === 'S') {
+  else if (key === 'S') {
     camera.position.set(12, 4, 4); controls.target.set(0, 1, 4); controls.update();
   }
 });
 
 animate();
 
-log('Validation Arena loaded. [Space] Fire | [R] Reset | [T] Top | [S] Side');
-setStatus('Ready. [Space] Fire, [R] Reset');
+log('Validation Arena loaded. WASD/Arrows drive • Space Fire • R Reset • Shift+T Top • Shift+S Side');
+setStatus('Ready. WASD Position, Space Fire, R Reset');
 
 console.log('Trebuchet Validation Arena loaded.');
 
