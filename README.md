@@ -18,19 +18,29 @@ Or double-click `start.bat` (training), `start_validate.bat` (validation), or `s
 
 | Key | Action |
 |---|---|
+| **W** | Drive forward (increase posZ) |
+| **S** | Drive backward (decrease posZ) |
+| **A** | Rotate heading left |
+| **D** | Rotate heading right |
+| **↑ / ↓ / ← / →** | Arrow key equivalents for W/A/S/D |
 | **Space** | Fire trebuchet |
 | **R** | Reset simulation |
-| **T** | Top camera view |
-| **S** | Side camera view |
+| **Shift+T** | Top camera view |
+| **Shift+S** | Side camera view |
 
 ### Validation Arena (`validate.html`)
 
 | Key | Action |
 |---|---|
+| **W** | Drive forward (increase posZ) |
+| **S** | Drive backward (decrease posZ) |
+| **A** | Rotate heading left |
+| **D** | Rotate heading right |
+| **↑ / ↓ / ← / →** | Arrow key equivalents for W/A/S/D |
 | **Space** | Fire trebuchet |
 | **R** | Reset simulation |
-| **T** | Top camera view |
-| **S** | Side camera view |
+| **Shift+T** | Top camera view |
+| **Shift+S** | Side camera view |
 
 ### Competition Arena (`competition.html`)
 
@@ -42,8 +52,8 @@ Or double-click `start.bat` (training), `start_validate.bat` (validation), or `s
 | **D / →** | Rotate heading right |
 | **Space** | Start match (WAITING) / Fire player robot (match) |
 | **R** | Full reset |
-| **T** | Top camera view |
-| **S** | Side camera view |
+| **Shift+T** | Top camera view |
+| **Shift+S** | Side camera view |
 | **1** | Default camera view |
 
 ## Training Arena (`index.html`)
