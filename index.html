@@ -23,7 +23,8 @@ canvas { display: block; }
 
 <div id="info">
   <div><strong>Baseball Trebuchet Simulator</strong>  <span id="score-display" style="float:right;color:#ffcc44;">Score: 0</span></div>
-  <div class="status" id="status-msg">Ready. Adjust parameters and press FIRE.</div>
+  <div class="status" id="status-msg">Ready. [Space] Fire • [R] Reset • [T] Top • [S] Side</div>
+  <div class="sub" style="color:#666;font-size:11px;margin-top:2px;border-top:1px solid rgba(255,255,255,0.08);padding-top:3px;">Keyboard: Space Fire • R Reset • T Top • S Side</div>
   <div id="log-container"></div>
 </div>
 
@@ -178,8 +179,8 @@ let trainingTrajectories = [];
 
 
 const FEASIBLE = {
-  posX: [-0.8, 0.8],
-  posZ: [1.5, 4.0],
+  posX: [0, 0],
+  posZ: [2.5, 2.5],
   heading: [-20, 20],
   pivotHeight: [0.5, 1.5],
   motorTorque: [5, 200],
@@ -187,8 +188,8 @@ const FEASIBLE = {
   leverLengthCW: [0.2, 1.0],
   releaseAngle: [75, 115],
 };
-// Parameters the AI is NOT allowed to mutate (physical robot constraints)
-const FIXED_PARAMS = new Set(['pivotHeight', 'leverLengthLoad', 'leverLengthCW']);
+// Parameters the AI is NOT allowed to mutate (physical robot constraints + anchored base)
+const FIXED_PARAMS = new Set(['posX', 'posZ', 'pivotHeight', 'leverLengthLoad', 'leverLengthCW']);
 
 // ===== Target Board Geometry =====
 // Board is 3.0m × 3.4m, centered at (0, 1.7, 7.5). 12 holes in 3-column × 4-row layout.
@@ -833,8 +834,10 @@ function buildTrebuchet() {
   armBody.addShape(new CANNON.Box(new CANNON.Vec3(0.025, 0.025, (ll + lc) / 2)));
   armBody.position.set(pivotX, pivotY, pivotZ);
 
+  // Tilt around the heading-rotated X axis so pivot direction stays fixed relative to heading
   const tiltQuat = new CANNON.Quaternion();
-  tiltQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  const hingeAxis = new CANNON.Vec3(cosH, 0, -sinH);
+  tiltQuat.setFromAxisAngle(hingeAxis, -INITIAL_ARM_ANGLE);
   armBody.quaternion = tiltQuat.mult(headingQuat);
   armBody.sleepSpeedLimit = 0.1;
   armBody.sleepTimeLimit = 0.5;
@@ -876,9 +879,9 @@ function buildTrebuchet() {
   baseGroup.rotation.y = h;
   trebuchetGroup.add(baseGroup);
 
-  // Arm wrapper group — synced to physics body; mesh offset within it for CAD calibration
+  // Arm wrapper group — child of baseGroup so it inherits heading rotation
   armGroup = new THREE.Group();
-  trebuchetGroup.add(armGroup);
+  baseGroup.add(armGroup);
 
   if (glbBase && glbArm) {
     // Use loaded CAD models
@@ -1083,7 +1086,7 @@ function checkRelease() {
 
   // Initial load direction in world space (local -Z with initial tilt + heading)
   const initQuat = new CANNON.Quaternion();
-  initQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  initQuat.setFromAxisAngle(hingeAxis, -INITIAL_ARM_ANGLE);
   const headQuat = new CANNON.Quaternion();
   headQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
   const fullInit = initQuat.mult(headQuat);
@@ -1280,7 +1283,7 @@ function predictHeight(params) {
 }
 
 // ===== K-Nearest Neighbors (accelerates learning by leveraging all past trials) =====
-const KNN_MUTABLE = ['posX', 'posZ', 'heading', 'motorTorque', 'releaseAngle'];
+const KNN_MUTABLE = ['heading', 'motorTorque', 'releaseAngle'];
 let knnData = [];
 
 function rebuildKNN() {
@@ -1377,8 +1380,8 @@ function randomParams() {
   if (knnData.length >= 10) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const p = {
-        posX: rand(-0.5, 0.5),
-        posZ: rand(1.5, 3.5),
+        posX: 0,
+        posZ: 2.5,
         heading: rand(-10, 10),
         pivotHeight: config.pivotHeight,
         motorTorque: rand(15, 120),
@@ -1394,8 +1397,8 @@ function randomParams() {
   }
   for (let attempt = 0; attempt < 50; attempt++) {
     const p = {
-      posX: rand(-0.5, 0.5),
-      posZ: rand(1.5, 3.5),
+      posX: 0,
+      posZ: 2.5,
       heading: rand(-10, 10),
       pivotHeight: config.pivotHeight,
       motorTorque: rand(15, 120),
@@ -1430,8 +1433,8 @@ function mutateParams(base) {
   const s = AI.mutationStd;
   const r = (v) => v * (1 + (Math.random() - 0.5) * 2 * s);
   const p = {
-    posX: clamp(base.posX + (Math.random() - 0.5) * 0.2, ...FEASIBLE.posX),
-    posZ: clamp(base.posZ + (Math.random() - 0.5) * 0.4, ...FEASIBLE.posZ),
+    posX: 0,
+    posZ: 2.5,
     heading: clamp(base.heading + (Math.random() - 0.5) * 6, ...FEASIBLE.heading),
     pivotHeight: base.pivotHeight,
     motorTorque: clamp(r(base.motorTorque), ...FEASIBLE.motorTorque),
@@ -1463,7 +1466,6 @@ function mutateByError(base, avgDz, avgDx, avgDy) {
   if (hasDx) {
     const latCorrection = clamp(avgDx * 0.3, -2, 2);
     p.heading = clamp(p.heading - latCorrection, ...FEASIBLE.heading);
-    p.posX = clamp(p.posX - avgDx * 0.08, ...FEASIBLE.posX);
   }
   if (hasDy) {
     const vertCorrection = clamp(avgDy * 0.08, -0.25, 0.25);
@@ -1480,8 +1482,6 @@ function mutateByError(base, avgDz, avgDx, avgDy) {
   if (!FIXED_PARAMS.has('leverLengthCW')) p.leverLengthCW = clamp(r(p.leverLengthCW), ...FEASIBLE.leverLengthCW);
   p.heading = clamp(p.heading + (Math.random() - 0.5) * 2, ...FEASIBLE.heading);
   p.releaseAngle = clamp(p.releaseAngle + (Math.random() - 0.5) * 3, ...FEASIBLE.releaseAngle);
-  p.posX = clamp(p.posX + (Math.random() - 0.5) * 0.08, ...FEASIBLE.posX);
-  p.posZ = clamp(p.posZ + (Math.random() - 0.5) * 0.12, ...FEASIBLE.posZ);
   return p;
 }
 
@@ -2239,6 +2239,8 @@ function AInextGen() {
   const solved = AI.solvedTargets.length;
   const totalTgts = AI.targetOrder.length;
   log(`Gen ${AI.gen - 1} done. Target: ${tgtId} (${solved}/${totalTgts})  Best: ${(AI.bestAccuracy * 100).toFixed(1)}%  Saved: ${AI.savedSets.length}  Gen Acc: ${pct}%${deltaStr}${errLog}  Total: ${AI.totalTrials}`);
+  // Simulated annealing: reduce mutation rate as fitness improves
+  AI.mutationStd = Math.max(0.01, 0.15 * (1 - Math.min(AI.bestAccuracy, 1)));
 }
 
 function AInextIndividual() {
@@ -2471,7 +2473,7 @@ function AIrecordTrial(hit, pos) {
     const avgDx = cur.sumDx / cur.count;
     const avgDy = cur.count > 0 && cur.sumDy !== 0 ? cur.sumDy / cur.count : 0;
     const radialDist = Math.sqrt(avgDz * avgDz + avgDx * avgDx + avgDy * avgDy);
-    trajectoryAcc = Math.max(0, 1 - radialDist / 2.5);
+    trajectoryAcc = Math.exp(-radialDist);
   }
   // KNN confidence bonus: params near well-explored high-performing regions get a small boost
   const knn = knnQuery(cur.params, currentTargetId());
@@ -2534,9 +2536,14 @@ function AIrecordTrial(hit, pos) {
 function syncPhysicsVisuals() {
   if (!armBody || !trebuchetGroup) return;
 
-  // Sync arm wrapper group to physics body
-  armGroup.position.copy(armBody.position);
-  armGroup.quaternion.copy(armBody.quaternion);
+  // Sync arm group — position relative to baseGroup (which has heading rotation)
+  const worldPos = new THREE.Vector3(armBody.position.x, armBody.position.y, armBody.position.z);
+  armGroup.parent.worldToLocal(armGroup.position.copy(worldPos));
+  // Extract tilt-only rotation (baseGroup provides the heading)
+  const tiltOnly = new THREE.Quaternion().copy(armBody.quaternion);
+  const invHeading = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -config.heading * RAD);
+  tiltOnly.multiply(invHeading);
+  armGroup.quaternion.copy(tiltOnly);
 
   // Sync ball mesh — follows ball body directly
   if (ballBody && ballMesh) {
@@ -2828,10 +2835,23 @@ if (trainingData.totalTrials > 0) {
   log('No memory found. Starting fresh.');
 }
 
+// ===== Keyboard Controls =====
+document.addEventListener('keydown', (e) => {
+  const key = e.key;
+  if (key === ' ' || key === 'Space') { e.preventDefault(); fireTrebuchet(); }
+  else if (key === 'r' || key === 'R') { if (!fired && !AI.running) resetSim(); }
+  else if ((key === 't' || key === 'T') && !e.ctrlKey && !e.metaKey) {
+    camera.position.set(0, 12, 4); controls.target.set(0, 0.5, 4); controls.update();
+  }
+  else if (key === 's' || key === 'S') {
+    camera.position.set(12, 4, 4); controls.target.set(0, 1, 4); controls.update();
+  }
+});
+
 animate();
 
-log('Simulation loaded. Adjust parameters and press FIRE.');
-setStatus('Ready.');
+log('Simulation loaded. [Space] Fire | [R] Reset | [T] Top | [S] Side');
+setStatus('Ready. [Space] Fire, [R] Reset');
 
 console.log('Baseball Trebuchet Arena Simulation loaded.');
 

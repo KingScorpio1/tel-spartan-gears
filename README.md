@@ -1,6 +1,6 @@
 # Tel-Spartan Gears — Baseball Trebuchet Arena
 
-A 3D physics simulation of a robotic trebuchet that launches baseballs at a target board with 12 holes. Features an evolutionary AI that learns to hit all targets, and a validation system to verify reliability.
+A 3D physics simulation of a robotic trebuchet that launches baseballs at a target board with 12 holes. Features an evolutionary AI that learns to hit all targets, a validation system to verify reliability, and a head-to-head competition mode.
 
 ## Quick Start
 
@@ -8,15 +8,49 @@ A 3D physics simulation of a robotic trebuchet that launches baseballs at a targ
 python server.py
 ```
 
-Then open [http://localhost:8765](http://localhost:8765) (training) or [http://localhost:8765/validate.html](http://localhost:8765/validate.html) (validation).
+Then open [http://localhost:8765](http://localhost:8765) (training), [http://localhost:8765/validate.html](http://localhost:8765/validate.html) (validation), or [http://localhost:8765/competition.html](http://localhost:8765/competition.html) (competition).
 
-Or double-click `start.bat` (training) or `start_validate.bat` (validation).
+Or double-click `start.bat` (training), `start_validate.bat` (validation), or `start_competition.bat` (competition).
+
+## Keyboard Shortcuts
+
+### Training Arena (`index.html`)
+
+| Key | Action |
+|---|---|
+| **Space** | Fire trebuchet |
+| **R** | Reset simulation |
+| **T** | Top camera view |
+| **S** | Side camera view |
+
+### Validation Arena (`validate.html`)
+
+| Key | Action |
+|---|---|
+| **Space** | Fire trebuchet |
+| **R** | Reset simulation |
+| **T** | Top camera view |
+| **S** | Side camera view |
+
+### Competition Arena (`competition.html`)
+
+| Key | Action |
+|---|---|
+| **W / ↑** | Drive robot forward |
+| **S / ↓** | Drive robot backward |
+| **A / ←** | Rotate heading left |
+| **D / →** | Rotate heading right |
+| **Space** | Start match (WAITING) / Fire player robot (match) |
+| **R** | Full reset |
+| **T** | Top camera view |
+| **S** | Side camera view |
+| **1** | Default camera view |
 
 ## Training Arena (`index.html`)
 
 Manual and AI-powered training sim. The robot arm fires a baseball at a 3m × 3.4m board 7.5m away with 12 holes (9 standard + 3 bonus).
 
-### Controls
+### GUI Controls
 
 | Folder | Parameters |
 |---|---|
@@ -90,6 +124,44 @@ Hits use a physics-based deflection model:
 
 Proximity (0–1) is tracked per trial and displayed in results.
 
+## Competition Arena (`competition.html`)
+
+Head-to-head 1v1 match simulation between the player's robot (blue) and a rival AI robot (red), each with 27 baseballs per half.
+
+### Match Structure
+
+| Phase | Duration | Description |
+|---|---|---|
+| **WAITING** | 5s countdown | Robots in starting boxes, configure position |
+| **FIRST_HALF** | 3:00 | AI-driven navigation to launch position |
+| **SECOND_HALF** | 3:00 | 1v1 match — both robots fire autonomously (WASD manual override available) |
+| **ENDED** | — | Final scores displayed |
+
+### Rules
+
+- Each robot starts with **27 balls** in the first half, **refilled to 27** at the start of the second half
+- **Designated Target Bonus**: A random target (t9/t10/t11) glows red for 60s at the start of each half — hitting it scores 2× points
+- Players can drive manually during both halves using **WASD / Arrow keys** (overrides AI navigation)
+- **Space** fires the player robot once positioned
+- First half: AI only (both robots navigate and fire autonomously)
+- Second half: Full 1v1 with both robots firing; player can manually reposition with WASD
+
+### Player Robot Controls
+
+| Control | Action |
+|---|---|
+| **WASD / Arrows** | Drive robot forward/backward/rotate |
+| **Space** | Start match / Fire at target |
+| **R** | Full reset to WAITING |
+| **T / S / 1** | Camera views (Top, Side, Default) |
+| **GUI** | Position, heading, mechanism, mass sliders |
+
+### Scoring
+
+- **Standard hit**: 1 point
+- **Bonus target hit** (within first 60s of half): 2 points
+- Match winner determined by total points after both halves
+
 ## Physics Model
 
 - **Engine**: [Cannon-es](https://github.com/pmndrs/cannon-es) physics + [Three.js](https://threejs.org) rendering
@@ -102,12 +174,13 @@ Proximity (0–1) is tracked per trial and displayed in results.
 
 ```
 sim/
-├── index.html          Training arena
-├── validate.html       Validation arena
-├── server.py           Python HTTP server (port 8765)
-├── start.bat           Launch training
-├── start_validate.bat  Launch validation
-├── models/             3D GLB models (robot arm, base)
+├── index.html              Training arena
+├── validate.html           Validation arena
+├── competition.html        Head-to-head competition arena
+├── server.py               Python HTTP server (port 8765)
+├── start.bat               Launch training
+├── start_validate.bat      Launch validation
+├── models/                 3D GLB models (robot arm, base)
 ├── .gitignore
 └── README.md
 ```

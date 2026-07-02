@@ -23,7 +23,8 @@ canvas { display: block; }
 
 <div id="info">
   <div><strong>Trebuchet Validation Arena</strong>  <span id="score-display" style="float:right;color:#ffcc44;">Score: 0</span></div>
-  <div class="status" id="status-msg">Ready. Adjust parameters and press FIRE.</div>
+  <div class="status" id="status-msg">Ready. [Space] Fire • [R] Reset • [T] Top • [S] Side</div>
+  <div class="sub" style="color:#666;font-size:11px;margin-top:2px;border-top:1px solid rgba(255,255,255,0.08);padding-top:3px;">Keyboard: Space Fire • R Reset • T Top • S Side</div>
   <div id="log-container"></div>
 </div>
 
@@ -155,8 +156,8 @@ let trainingData = { targetOrder: [], validatedTargets: [], failedTargets: [], v
 
 
 const FEASIBLE = {
-  posX: [-0.8, 0.8],
-  posZ: [1.5, 4.0],
+  posX: [0, 0],
+  posZ: [2.5, 2.5],
   heading: [-20, 20],
   pivotHeight: [0.5, 1.5],
   motorTorque: [5, 200],
@@ -164,7 +165,7 @@ const FEASIBLE = {
   leverLengthCW: [0.2, 1.0],
   releaseAngle: [75, 115],
 };
-const FIXED_PARAMS = new Set(['pivotHeight', 'leverLengthLoad', 'leverLengthCW']);
+const FIXED_PARAMS = new Set(['posX', 'posZ', 'pivotHeight', 'leverLengthLoad', 'leverLengthCW']);
 
 // ===== Target Board Geometry =====
 const BOARD = {
@@ -805,8 +806,10 @@ function buildTrebuchet() {
   armBody.addShape(new CANNON.Box(new CANNON.Vec3(0.025, 0.025, (ll + lc) / 2)));
   armBody.position.set(pivotX, pivotY, pivotZ);
 
+  // Tilt around the heading-rotated X axis so pivot direction stays fixed relative to heading
   const tiltQuat = new CANNON.Quaternion();
-  tiltQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  const hingeAxis = new CANNON.Vec3(cosH, 0, -sinH);
+  tiltQuat.setFromAxisAngle(hingeAxis, -INITIAL_ARM_ANGLE);
   armBody.quaternion = tiltQuat.mult(headingQuat);
   armBody.sleepSpeedLimit = 0.1;
   armBody.sleepTimeLimit = 0.5;
@@ -846,9 +849,9 @@ function buildTrebuchet() {
   baseGroup.rotation.y = h;
   trebuchetGroup.add(baseGroup);
 
-  // Arm wrapper group — synced to physics body; mesh offset within it for CAD calibration
+  // Arm wrapper group — child of baseGroup so it inherits heading rotation
   armGroup = new THREE.Group();
-  trebuchetGroup.add(armGroup);
+  baseGroup.add(armGroup);
 
   if (glbBase && glbArm) {
     // Use loaded CAD models
@@ -1051,7 +1054,7 @@ function checkRelease() {
 
   // Initial load direction in world space (local -Z with initial tilt + heading)
   const initQuat = new CANNON.Quaternion();
-  initQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -INITIAL_ARM_ANGLE);
+  initQuat.setFromAxisAngle(hingeAxis, -INITIAL_ARM_ANGLE);
   const headQuat = new CANNON.Quaternion();
   headQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
   const fullInit = initQuat.mult(headQuat);
@@ -2323,9 +2326,14 @@ function clearResults() {
 function syncPhysicsVisuals() {
   if (!armBody || !trebuchetGroup) return;
 
-  // Sync arm wrapper group to physics body
-  armGroup.position.copy(armBody.position);
-  armGroup.quaternion.copy(armBody.quaternion);
+  // Sync arm group — position relative to baseGroup (which has heading rotation)
+  const worldPos = new THREE.Vector3(armBody.position.x, armBody.position.y, armBody.position.z);
+  armGroup.parent.worldToLocal(armGroup.position.copy(worldPos));
+  // Extract tilt-only rotation (baseGroup provides the heading)
+  const tiltOnly = new THREE.Quaternion().copy(armBody.quaternion);
+  const invHeading = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -config.heading * RAD);
+  tiltOnly.multiply(invHeading);
+  armGroup.quaternion.copy(tiltOnly);
 
   // Sync ball mesh — follows ball body directly
   if (ballBody && ballMesh) {
@@ -2573,10 +2581,23 @@ if (validator.sets.length > 0) {
   log('No saved validation data found. Load from Memory or Import CSV.');
 }
 
+// ===== Keyboard Controls =====
+document.addEventListener('keydown', (e) => {
+  const key = e.key;
+  if (key === ' ' || key === 'Space') { e.preventDefault(); fireTrebuchet(); }
+  else if (key === 'r' || key === 'R') { if (!fired) resetSim(); }
+  else if ((key === 't' || key === 'T') && !e.ctrlKey && !e.metaKey) {
+    camera.position.set(0, 12, 4); controls.target.set(0, 0.5, 4); controls.update();
+  }
+  else if (key === 's' || key === 'S') {
+    camera.position.set(12, 4, 4); controls.target.set(0, 1, 4); controls.update();
+  }
+});
+
 animate();
 
-log('Validation Arena loaded. Load parameter sets and press START.');
-setStatus('Ready. Load parameter sets to validate.');
+log('Validation Arena loaded. [Space] Fire | [R] Reset | [T] Top | [S] Side');
+setStatus('Ready. [Space] Fire, [R] Reset');
 
 console.log('Trebuchet Validation Arena loaded.');
 

@@ -1,0 +1,1674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TEL Robot Combat — Competition Arena</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #111; font-family: 'Segoe UI', Arial, sans-serif; }
+#hud {
+  position: absolute; top: 0; left: 0; right: 0; z-index: 10;
+  display: flex; justify-content: space-between; padding: 12px 20px;
+  pointer-events: none;
+}
+#hud-left {
+  color: #fff; background: rgba(0,0,0,0.75); padding: 12px 18px;
+  border-radius: 8px; font-size: 14px; min-width: 220px;
+  border: 1px solid rgba(255,255,255,0.1);
+}
+#hud-left .phase { font-size: 18px; font-weight: bold; margin-bottom: 6px; }
+#hud-left .phase.waiting { color: #ffcc44; }
+#hud-left .phase.match { color: #44ff88; }
+#hud-left .phase.overtime { color: #ff4444; }
+#hud-left .timer { font-size: 28px; font-weight: bold; margin: 4px 0; }
+#hud-left .sub { color: #aaa; font-size: 12px; }
+#hud-right {
+  text-align: right;
+}
+#hud-right .score-box {
+  background: rgba(0,0,0,0.75); padding: 8px 16px; border-radius: 8px;
+  border: 1px solid rgba(255,255,255,0.1); margin-bottom: 6px;
+}
+#hud-right .score-box .team { font-size: 12px; color: #888; }
+#hud-right .score-box .pts { font-size: 22px; font-weight: bold; }
+#hud-right .score-box .pts.player-pts { color: #44aaff; }
+#hud-right .score-box .pts.rival-pts { color: #ff4444; }
+#hud-right #bonus-indicator {
+  background: rgba(255,0,0,0.2); border: 1px solid #ff4444;
+  padding: 6px 12px; border-radius: 6px; margin-top: 6px;
+  font-size: 13px; color: #ff6666;
+  opacity: 0; transition: opacity 0.3s;
+}
+#hud-right #bonus-indicator.active { opacity: 1; }
+#phase-tip {
+  position: absolute; bottom: 60px; left: 50%; transform: translateX(-50%);
+  z-index: 10;
+  background: rgba(0,0,0,0.85); padding: 12px 28px; border-radius: 10px;
+  border: 1px solid rgba(255,255,255,0.15);
+  color: #fff; font-size: 18px; font-weight: bold;
+  pointer-events: none;
+  transition: opacity 0.5s;
+}
+#phase-tip .highlight { color: #ffcc44; }
+canvas { display: block; }
+#info { display: none; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div id="hud-left">
+    <div class="phase waiting" id="phase-text">WAITING</div>
+    <div class="timer" id="timer-display">--:--</div>
+    <div class="sub" id="status-msg">Ready.</div>
+    <div class="sub" style="color:#888;font-size:11px;margin-top:2px;">WASD Drive • Space Start/Fire • R Reset • T/S/1 Views</div>
+    <div id="log-container" style="margin-top:8px;max-height:120px;overflow-y:auto;pointer-events:auto;font-size:12px;color:#8cf;"></div>
+  </div>
+  <div id="hud-right">
+    <div class="score-box">
+      <div class="team">PLAYER (Blue)</div>
+      <div class="pts player-pts" id="player-score">0</div>
+      <div class="sub" style="color:#4488ff;font-size:11px;" id="player-balls">⚾ 27</div>
+    </div>
+    <div class="score-box">
+      <div class="team">RIVAL (Red)</div>
+      <div class="pts rival-pts" id="rival-score">0</div>
+      <div class="sub" style="color:#ff4444;font-size:11px;" id="rival-balls">⚾ 27</div>
+    </div>
+    <div id="bonus-indicator">★ BONUS TARGET ACTIVE — 2× Points</div>
+  </div>
+</div>
+
+<div id="phase-tip">Get ready for the match!</div>
+
+<div class="controls" id="controls" style="position:absolute;bottom:10px;left:50%;transform:translateX(-50%);z-index:10;display:flex;gap:10px;">
+  <button id="btn-start" style="padding:10px 24px;font-size:16px;border:none;border-radius:6px;background:#44aa44;color:#fff;cursor:pointer;font-weight:bold;">▶ START MATCH</button>
+  <button id="btn-reset" style="padding:10px 24px;font-size:16px;border:none;border-radius:6px;background:#666;color:#fff;cursor:pointer;font-weight:bold;">↺ RESET</button>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.163.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.163.0/examples/jsm/",
+    "cannon-es": "https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.1/dist/lil-gui.esm.min.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import * as CANNON from 'cannon-es';
+import GUI from 'lil-gui';
+
+const RAD = Math.PI / 180;
+
+// ===== Configuration =====
+const config = {
+  posX: 0,
+  posZ: 2.5,
+  heading: 0,
+  pivotHeight: 1.0,
+  armMass: 4,
+  baseMass: 5,
+  motorTorque: 50,
+  leverLengthLoad: 1.0,
+  leverLengthCW: 0.5,
+  releaseAngle: 95,
+  modelScale: 0.001,
+  meshOffsetX: 0.026834891011241178,
+  meshOffsetY: -0.04495506623028258,
+  meshOffsetZ: 0.11745446247127002,
+  basePivotX: -0.23770602831864113,
+  basePivotY: 0.5103886551333617,
+  basePivotZ: 0.2807155949677642,
+  ballOffsetX: -1.0978787323707632e-9,
+  ballOffsetY: 0.1050171276281931,
+  ballOffsetZ: 0.6686593295498562,
+};
+
+const INITIAL_ARM_ANGLE = 45 * RAD;
+
+// Rival robot config — mirrored from player to keep separate lane
+const rivalConfig = {
+  posX: 1.0,
+  posZ: 2.0,
+  heading: 0,
+};
+
+// ===== Game State Machine =====
+const STATE = {
+  WAITING: 'WAITING',
+  FIRST_HALF: 'FIRST_HALF',
+  SECOND_HALF: 'SECOND_HALF',
+  ENDED: 'ENDED',
+};
+let gameState = STATE.WAITING;
+let matchTimer = 0;          // seconds elapsed in current half
+let halfDuration = 180;      // 3 minutes per half
+let waitingCountdown = 10;   // seconds before match starts
+let bonusTimer = 0;          // seconds of bonus period elapsed
+let bonusTargetId = null;    // t9/t10/t11 randomly chosen
+let bonusActive = false;
+let halfCounter = 0;         // 0 = pre-match, 1 = first half done, 2 = both halves done
+let playerScore = 0;
+let rivalScore = 0;
+const MAX_BALLS = 27;
+let playerBalls = MAX_BALLS;
+let rivalBalls = MAX_BALLS;
+let playerHasFired = false;
+let rivalHasFired = false;
+
+// Navigation
+let playerNavTarget = null;       // { x, z, heading } or null
+let rivalNavTarget = null;
+let playerReachedTarget = false;
+let rivalReachedTarget = false;
+const NAV_SPEED = 1.0;           // m/s translation speed
+const NAV_HEADING_SPEED = 2.0;   // rad/s rotation speed
+const REACH_RADIUS = 0.05;       // how close to target before "reached"
+const RIVAL_BLOCK_RADIUS = 0.6;  // if rival within this, recalibrate
+const RECALC_SHIFT = 0.8;        // lateral shift when blocked
+
+// Keyboard input state
+const keys = {};
+
+// ===== Scene Globals =====
+let scene, camera, renderer, controls, clock;
+let world;
+let boardGroup;
+let playerGroup, rivalGroup;
+let playerArmBody, playerMountBody, playerBallBody, playerHinge, playerBaseGroup, playerArmGroup;
+let rivalArmBody, rivalMountBody, rivalBallBody, rivalHinge, rivalBaseGroup, rivalArmGroup;
+let playerBaseBody, rivalBaseBody;
+let playerBallMesh, rivalBallMesh;
+let playerFired = false, playerReleased = false, playerLanded = false, playerHasHit = false;
+let rivalFired = false, rivalReleased = false, rivalLanded = false, rivalHasHit = false;
+let playerFiredTime = 0, rivalFiredTime = 0;
+let playerFiredWallTime = 0, rivalFiredWallTime = 0;
+let playerTrailPoints = [], rivalTrailPoints = [];
+let playerTrailLine, rivalTrailLine;
+let playerBoardCrossY = null, rivalBoardCrossY = null;
+let playerBoardCrossVx, playerBoardCrossVy, playerBoardCrossVz;
+let rivalBoardCrossVx, rivalBoardCrossVy, rivalBoardCrossVz;
+let ballMat, wallMat;
+let hitTargets = [];
+let targetIdCounter = 0;
+let glbBase = null, glbArm = null;
+const glbLoader = new GLTFLoader();
+const MODEL_PATH = './models/';
+
+// DOM refs
+const phaseEl = document.getElementById('phase-text');
+const timerEl = document.getElementById('timer-display');
+const statusEl = document.getElementById('status-msg');
+const logEl = document.getElementById('log-container');
+const tipEl = document.getElementById('phase-tip');
+const bonusIndicator = document.getElementById('bonus-indicator');
+const playerScoreEl = document.getElementById('player-score');
+const rivalScoreEl = document.getElementById('rival-score');
+
+// ===== Utility =====
+function log(msg, isHit = false) {
+  const div = document.createElement('div');
+  div.textContent = msg;
+  div.style.color = isHit ? '#f66' : '#8cf';
+  div.style.fontWeight = isHit ? 'bold' : 'normal';
+  logEl.appendChild(div);
+  if (logEl.children.length > 30) logEl.removeChild(logEl.firstChild);
+}
+function setStatus(msg) { statusEl.textContent = msg; }
+function updatePlayerScore() { playerScoreEl.textContent = playerScore; }
+function updateRivalScore() { rivalScoreEl.textContent = rivalScore; }
+function updateBallDisplay() {
+  document.getElementById('player-balls').textContent = `⚾ ${playerBalls}`;
+  document.getElementById('rival-balls').textContent = `⚾ ${rivalBalls}`;
+}
+function rand(min, max) { return min + Math.random() * (max - min); }
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ===== Target Board (same geometry as index.html) =====
+const BOARD = {
+  centerX: 0, centerY: 1.7, centerZ: 7.5,
+  halfW: 1.5, halfH: 1.7,
+  holes: [
+    { id: 't0', x: -0.9, y: 1.4, r: 0.2 },
+    { id: 't1', x:    0, y: 1.4, r: 0.2 },
+    { id: 't2', x:  0.9, y: 1.4, r: 0.2 },
+    { id: 't3', x: -0.9, y: 2.0, r: 0.2 },
+    { id: 't4', x:    0, y: 2.0, r: 0.2 },
+    { id: 't5', x:  0.9, y: 2.0, r: 0.2 },
+    { id: 't6', x: -0.9, y: 2.6, r: 0.2 },
+    { id: 't7', x:    0, y: 2.6, r: 0.2 },
+    { id: 't8', x:  0.9, y: 2.6, r: 0.2 },
+    { id: 't9',  x: -0.9, y: 3.15, r: 0.1 },
+    { id: 't10', x:    0, y: 3.15, r: 0.1 },
+    { id: 't11', x:  0.9, y: 3.15, r: 0.1 },
+  ],
+};
+const TARGET_POINTS = { standard: 1, bonus: 3 };
+let targetCircles = [];
+
+function getTargetCenter(id) {
+  const h = BOARD.holes.find(h => h.id === id);
+  return h ? { x: h.x, y: h.y, z: BOARD.centerZ } : { x: 0, y: 0, z: 7.5 };
+}
+
+// ===== Scene Init =====
+function initScene() {
+  clock = new THREE.Clock();
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+  scene.fog = new THREE.Fog(0x1a1a2e, 25, 45);
+
+  camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 60);
+  camera.position.set(8, 7, 6);
+  camera.lookAt(0, 1.5, 4);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.2;
+  document.body.appendChild(renderer.domElement);
+
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 1.5, 4);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.maxPolarAngle = Math.PI / 2.05;
+  controls.update();
+
+  const ambient = new THREE.AmbientLight(0x404060, 0.6);
+  scene.add(ambient);
+  const hemi = new THREE.HemisphereLight(0x87ceeb, 0x362d1a, 0.8);
+  scene.add(hemi);
+  const sun = new THREE.DirectionalLight(0xffeedd, 2.2);
+  sun.position.set(10, 15, 5);
+  sun.castShadow = true;
+  sun.shadow.mapSize.width = 2048;
+  sun.shadow.mapSize.height = 2048;
+  sun.shadow.camera.near = 0.5;
+  sun.shadow.camera.far = 35;
+  sun.shadow.camera.left = -12;
+  sun.shadow.camera.right = 12;
+  sun.shadow.camera.top = 12;
+  sun.shadow.camera.bottom = -4;
+  scene.add(sun);
+  const fill = new THREE.DirectionalLight(0x8888ff, 0.4);
+  fill.position.set(-5, 3, -8);
+  scene.add(fill);
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+}
+
+// ===== Physics Init =====
+function initPhysics() {
+  world = new CANNON.World();
+  world.gravity.set(0, 0, 0);
+  world.broadphase = new CANNON.SAPBroadphase(world);
+  world.allowSleep = true;
+  world.solver.iterations = 20;
+
+  const groundMat = new CANNON.Material('ground');
+  ballMat = new CANNON.Material('ball');
+  wallMat = new CANNON.Material('wall');
+
+  const groundShape = new CANNON.Plane();
+  const groundBody = new CANNON.Body({ mass: 0, material: groundMat });
+  groundBody.addShape(groundShape);
+  groundBody.quaternion.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), -Math.PI / 2);
+  world.addBody(groundBody);
+
+  world.addContactMaterial(new CANNON.ContactMaterial(ballMat, groundMat, { friction: 0.4, restitution: 0.55 }));
+  world.addContactMaterial(new CANNON.ContactMaterial(ballMat, wallMat, { friction: 0.3, restitution: 0.5 }));
+  return { ballMat, groundMat, wallMat };
+}
+
+// ===== Arena =====
+function buildArena() {
+  // Ground
+  const groundGeo = new THREE.PlaneGeometry(30, 40);
+  groundGeo.rotateX(-Math.PI / 2);
+  const groundMat = new THREE.MeshStandardMaterial({ color: 0x2a2a3a, roughness: 0.9, metalness: 0.0 });
+  const ground = new THREE.Mesh(groundGeo, groundMat);
+  ground.receiveShadow = true;
+  ground.position.set(0, -0.01, 4);
+  scene.add(ground);
+
+  const gridHelper = new THREE.GridHelper(30, 30, 0x444466, 0x333355);
+  gridHelper.position.set(0, 0.001, 4);
+  scene.add(gridHelper);
+
+  // Robot Operation Zone
+  const zoneGeo = new THREE.PlaneGeometry(4, 5);
+  zoneGeo.rotateX(-Math.PI / 2);
+  const zoneMat = new THREE.MeshStandardMaterial({ color: 0x1a3a2a, transparent: true, opacity: 0.25, roughness: 0.8 });
+  const zone = new THREE.Mesh(zoneGeo, zoneMat);
+  zone.position.set(0, 0.002, 2.5);
+  zone.receiveShadow = true;
+  scene.add(zone);
+
+  const borderMat = new THREE.LineBasicMaterial({ color: 0x44ff88, transparent: true, opacity: 0.5 });
+  const pts = [[-2, 0], [2, 0], [2, 5], [-2, 5], [-2, 0]].map(([x, z]) => new THREE.Vector3(x, 0.005, z));
+  const borderGeo = new THREE.BufferGeometry().setFromPoints(pts);
+  scene.add(new THREE.Line(borderGeo, borderMat));
+
+  // Zone label
+  const canvas = document.createElement('canvas');
+  canvas.width = 256; canvas.height = 64;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0, 0, 256, 64);
+  ctx.fillStyle = '#44ff88'; ctx.font = 'bold 28px Arial'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('ROBOT ZONE', 128, 32);
+  const labelTex = new THREE.CanvasTexture(canvas);
+  const labelMat = new THREE.SpriteMaterial({ map: labelTex, transparent: true, opacity: 0.7 });
+  const label = new THREE.Sprite(labelMat);
+  label.position.set(0, 0.05, 2.5); label.scale.set(2.5, 0.625, 1);
+  scene.add(label);
+
+  // Distance markers
+  function makeLabel(text, x, z, color, size) {
+    const c = document.createElement('canvas'); c.width = 128; c.height = 48;
+    const cx = c.getContext('2d');
+    cx.fillStyle = 'rgba(0,0,0,0.6)'; cx.fillRect(0, 0, 128, 48);
+    cx.fillStyle = color || '#888'; cx.font = 'bold 22px monospace'; cx.textAlign = 'center'; cx.textBaseline = 'middle';
+    cx.fillText(text, 64, 26);
+    const tex = new THREE.CanvasTexture(c);
+    const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+    const spr = new THREE.Sprite(mat);
+    spr.position.set(x, 0.03, z); spr.scale.set(size || 0.6, (size || 0.6) * 0.375, 1);
+    scene.add(spr);
+  }
+  for (let z = 0; z <= 8; z++) makeLabel(`${z}m`, -2.3, z, z === 7 ? '#ff8844' : '#666');
+  makeLabel('BOARD', -2.3, 7.5, '#ff8844');
+  for (let x = -1.5; x <= 1.5; x += 0.5) makeLabel(x.toFixed(1), x, 7.8, '#666', 0.4);
+}
+
+// ===== Starting Boxes =====
+function buildStartingBoxes() {
+  const boxMat = new THREE.MeshStandardMaterial({ color: 0x444466, transparent: true, opacity: 0.15, roughness: 0.6 });
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0x6666aa, transparent: true, opacity: 0.6 });
+
+  function addBox(cx, cz) {
+    const w = 0.7, d = 1.2;
+    const box = new THREE.Mesh(new THREE.BoxGeometry(w, 0.02, d), boxMat);
+    box.position.set(cx, 0.005, cz);
+    scene.add(box);
+
+    const corners = [
+      [cx - w/2, cz - d/2], [cx + w/2, cz - d/2],
+      [cx + w/2, cz + d/2], [cx - w/2, cz + d/2], [cx - w/2, cz - d/2]
+    ];
+    const edgePts = corners.map(([x, z]) => new THREE.Vector3(x, 0.008, z));
+    const geo = new THREE.BufferGeometry().setFromPoints(edgePts);
+    scene.add(new THREE.Line(geo, edgeMat));
+
+    // Physics walls
+    for (const [ww, hw, dw, wx, wz] of [[w, 0.3, 0.06, cx, cz - d/2], [w, 0.3, 0.06, cx, cz + d/2], [0.06, 0.3, d, cx - w/2, cz], [0.06, 0.3, d, cx + w/2, cz]]) {
+      const wallBody = new CANNON.Body({ mass: 0, material: wallMat });
+      wallBody.addShape(new CANNON.Box(new CANNON.Vec3(ww/2, 0.15, dw/2)));
+      wallBody.position.set(wx, 0.15, wz);
+      world.addBody(wallBody);
+    }
+  }
+
+  // Player: left box, Rival: right box
+  addBox(-1.65, 0.6); // Player start
+  addBox(1.65, 0.6);  // Rival start
+}
+
+// ===== Field Barriers =====
+function buildFieldBarriers() {
+  const HW = 2, D = 11, HC = 4, HWd = 0.5, T = 0.12;
+  const woodMat = new THREE.MeshStandardMaterial({ color: 0x8B5A2B, roughness: 0.9 });
+  const canvasMat = new THREE.MeshPhysicalMaterial({ color: 0x88ddff, transparent: true, opacity: 0.12, roughness: 0.1, side: THREE.DoubleSide, depthWrite: false });
+  const trussMat = new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.6, metalness: 0.3 });
+
+  function addBarrier(w, h, d, px, py, pz, mat) {
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+    mesh.position.set(px, py, pz); scene.add(mesh);
+    const body = new CANNON.Body({ mass: 0, material: wallMat });
+    body.addShape(new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)));
+    body.position.set(px, py, pz); world.addBody(body);
+  }
+  addBarrier(T, HWd, 5, -HW, HWd/2, 2.5, woodMat);
+  addBarrier(T, HWd, 5,  HW, HWd/2, 2.5, woodMat);
+  addBarrier(4, HWd, T, 0, HWd/2, -T/2, woodMat);
+  addBarrier(4, HWd, T, 0, HWd/2, 5, woodMat);
+  addBarrier(T, HC, D, -HW, HC/2, D/2, canvasMat);
+  addBarrier(T, HC, D,  HW, HC/2, D/2, canvasMat);
+  addBarrier(4, HC, T, 0, HWd + HC/2, -T/2, canvasMat);
+  addBarrier(4, HC, T, 0, HC/2, D + T/2, canvasMat);
+  addBarrier(4, T, D, 0, HC, D/2, canvasMat);
+  const pillarH = HC, pillarW = 0.25;
+  for (const [cx, cz] of [[-HW, 0], [HW, 0], [-HW, D], [HW, D]]) {
+    const pMesh = new THREE.Mesh(new THREE.BoxGeometry(pillarW, pillarH, pillarW), trussMat);
+    pMesh.position.set(cx, pillarH/2, cz); scene.add(pMesh);
+    const pBody = new CANNON.Body({ mass: 0, material: wallMat });
+    pBody.addShape(new CANNON.Box(new CANNON.Vec3(pillarW/2, pillarH/2, pillarW/2)));
+    pBody.position.set(cx, pillarH/2, cz); world.addBody(pBody);
+  }
+}
+
+// ===== Target Board =====
+function buildTargetBoard() {
+  boardGroup = new THREE.Group();
+  boardGroup.position.set(0, 1.7, 7.5);
+  scene.add(boardGroup);
+
+  targetCircles = [];
+  hitTargets = [];
+  targetIdCounter = 0;
+
+  const stdRadius = 0.2, bonusRadius = 0.1;
+  const stdY = [-0.3, 0.3, 0.9];
+  const bonusY = [1.45];
+  const cols = [-0.9, 0, 0.9];
+  const positions = [];
+  for (const y of stdY) for (const x of cols) positions.push({ id: `t${targetIdCounter++}`, x, y, r: stdRadius, type: 'standard' });
+  for (const y of bonusY) for (const x of cols) positions.push({ id: `t${targetIdCounter++}`, x, y, r: bonusRadius, type: 'bonus' });
+
+  const boardShape = new THREE.Shape();
+  boardShape.moveTo(-1.5, -1.7); boardShape.lineTo(1.5, -1.7);
+  boardShape.lineTo(1.5, 1.7); boardShape.lineTo(-1.5, 1.7); boardShape.lineTo(-1.5, -1.7);
+  for (const p of positions) {
+    const hole = new THREE.Path();
+    for (let i = 0; i <= 32; i++) {
+      const theta = (i / 32) * Math.PI * 2;
+      const hx = p.x + p.r * Math.cos(theta), hy = p.y + p.r * Math.sin(theta);
+      if (i === 0) hole.moveTo(hx, hy); else hole.lineTo(hx, hy);
+    }
+    boardShape.holes.push(hole);
+  }
+
+  const boardMat = new THREE.MeshStandardMaterial({ color: 0x2a2a4a, roughness: 0.6, metalness: 0.2, side: THREE.DoubleSide });
+  const board = new THREE.Mesh(new THREE.ShapeGeometry(boardShape), boardMat);
+  board.position.z = -0.01; boardGroup.add(board);
+
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0x6666aa });
+  const edgePts = [[-1.5, -1.7, 0], [1.5, -1.7, 0], [1.5, 1.7, 0], [-1.5, 1.7, 0], [-1.5, -1.7, 0]].map(v => new THREE.Vector3(v[0], v[1], v[2]));
+  boardGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(edgePts), edgeMat));
+
+  // Target ring colors
+  const circleMatBase = new THREE.MeshStandardMaterial({ color: 0x334455, emissive: 0x000000, emissiveIntensity: 0, side: THREE.DoubleSide, transparent: true, opacity: 0.4 });
+  const bonusMatOn = new THREE.MeshStandardMaterial({ color: 0x44ff88, emissive: 0x22ff44, emissiveIntensity: 0.15, side: THREE.DoubleSide, transparent: true, opacity: 0.8 });
+  const hitMat = new THREE.MeshStandardMaterial({ color: 0xff3333, emissive: 0xff0000, emissiveIntensity: 0.8, side: THREE.DoubleSide, transparent: true, opacity: 0.95 });
+
+  for (const p of positions) {
+    const mat = p.type === 'bonus' ? bonusMatOn.clone() : circleMatBase.clone();
+    const g = new THREE.RingGeometry(p.r * 0.7, p.r * 1.05, 24);
+    const m = new THREE.Mesh(g, mat);
+    m.position.set(p.x, p.y, 0.001);
+    boardGroup.add(m);
+    targetCircles.push({ mesh: m, data: { ...p, hit: false }, hitMat: hitMat.clone(), origMat: mat, bonusGlow: false });
+  }
+
+  // Physics board frame (same as index.html)
+  const boardFrame = new CANNON.Body({ mass: 0, material: wallMat });
+  const BZ = 0.08, BH = 1.7, BW = 1.48;
+  const holes = [];
+  for (const y of stdY) for (const x of cols) holes.push({ x, y, r: 0.2 });
+  for (const y of bonusY) for (const x of cols) holes.push({ x, y, r: 0.1 });
+  for (const g of [{ x: -1.3, w: 0.4 }, { x: -0.45, w: 0.5 }, { x: 0.45, w: 0.5 }, { x: 1.3, w: 0.4 }]) {
+    boardFrame.addShape(new CANNON.Box(new CANNON.Vec3(g.w / 2, BH, BZ)), new CANNON.Vec3(g.x, 0, 0));
+  }
+  for (const g of [{ y: -1.1, h: 1.2 }, { y: 0, h: 0.2 }, { y: 0.6, h: 0.2 }, { y: 1.225, h: 0.25 }, { y: 1.625, h: 0.15 }]) {
+    boardFrame.addShape(new CANNON.Box(new CANNON.Vec3(BW, g.h / 2, BZ)), new CANNON.Vec3(0, g.y, 0));
+  }
+  const cornerSize = 0.07;
+  for (const h of holes) {
+    const d = h.r + cornerSize * 0.3;
+    for (const sx of [-1, 1]) for (const sy of [-1, 1]) {
+      boardFrame.addShape(new CANNON.Box(new CANNON.Vec3(cornerSize / 2, cornerSize / 2, BZ)), new CANNON.Vec3(h.x + sx * d, h.y + sy * d, 0));
+    }
+  }
+  boardFrame.position.set(0, 1.7, 7.58);
+  world.addBody(boardFrame);
+
+  // Catching tubes
+  const TUBE_LEN = 0.5, TUBE_THICK = 0.06, TUBE_ANGLE = 5 * RAD;
+  const tubeQuat = new CANNON.Quaternion();
+  tubeQuat.setFromAxisAngle(new CANNON.Vec3(1, 0, 0), TUBE_ANGLE);
+  for (const p of positions) {
+    const rTube = p.r * 0.85, hw = rTube, hh = rTube;
+    const wx = p.x, wy = p.y + 1.7;
+    const dY = -TUBE_LEN * Math.sin(TUBE_ANGLE), dZ = TUBE_LEN * Math.cos(TUBE_ANGLE);
+    const tubeBody = new CANNON.Body({ mass: 0, material: wallMat });
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, TUBE_THICK, TUBE_LEN)), new CANNON.Vec3(0, hh, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, TUBE_THICK, TUBE_LEN)), new CANNON.Vec3(0, -hh, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(TUBE_THICK, hh, TUBE_LEN)), new CANNON.Vec3(-hw, 0, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(TUBE_THICK, hh, TUBE_LEN)), new CANNON.Vec3(hw, 0, 0));
+    tubeBody.addShape(new CANNON.Box(new CANNON.Vec3(hw, hh, TUBE_THICK)), new CANNON.Vec3(0, 0, 0));
+    tubeBody.position.set(wx, wy + dY, 7.5 + dZ);
+    tubeBody.quaternion.copy(tubeQuat);
+    world.addBody(tubeBody);
+
+    const tubeVisMat = new THREE.MeshPhysicalMaterial({ color: 0x88ddff, transparent: true, opacity: 0.15, roughness: 0.3, side: THREE.DoubleSide, depthWrite: false });
+    const tubeVis = new THREE.Mesh(new THREE.BoxGeometry(hw * 2, hh * 2, TUBE_LEN), tubeVisMat);
+    tubeVis.position.copy(tubeBody.position); tubeVis.quaternion.copy(tubeBody.quaternion);
+    scene.add(tubeVis);
+    const eMat = new THREE.LineBasicMaterial({ color: 0x88ddff, transparent: true, opacity: 0.3 });
+    const edge = new THREE.LineSegments(new THREE.EdgesGeometry(tubeVis.geometry), eMat);
+    edge.position.copy(tubeVis.position); edge.quaternion.copy(tubeVis.quaternion);
+    scene.add(edge);
+  }
+}
+
+// ===== Designated Target Bonus =====
+function pickBonusTarget() {
+  const bonusIds = ['t9', 't10', 't11'];
+  const pick = bonusIds[Math.floor(Math.random() * 3)];
+  bonusTargetId = pick;
+  bonusTimer = 0;
+  bonusActive = true;
+  bonusIndicator.classList.add('active');
+  bonusIndicator.textContent = `★ BONUS: ${pick} — 2× Points (60s)`;
+  log(`★ Designated Bonus Target: ${pick} — 2× points for first 60s!`, true);
+
+  for (const tc of targetCircles) {
+    if (tc.data.id === pick) {
+      tc.bonusGlow = true;
+      tc.mesh.material.color.setHex(0xff2222);
+      tc.mesh.material.emissive.setHex(0xff0000);
+      tc.mesh.material.emissiveIntensity = 0.6;
+    }
+  }
+}
+
+function updateBonusTimer(dt) {
+  if (!bonusActive) return;
+  bonusTimer += dt;
+  if (bonusTimer >= 60) {
+    bonusActive = false;
+    bonusIndicator.classList.remove('active');
+    log('★ Bonus period ended — points reverted to normal.');
+
+    for (const tc of targetCircles) {
+      if (tc.data.id === bonusTargetId) {
+        tc.bonusGlow = false;
+        tc.mesh.material.color.copy(tc.origMat.color);
+        tc.mesh.material.emissive.copy(tc.origMat.emissive);
+        tc.mesh.material.emissiveIntensity = tc.origMat.emissiveIntensity;
+      }
+    }
+    bonusTargetId = null;
+  } else {
+    const remaining = 60 - Math.floor(bonusTimer);
+    bonusIndicator.textContent = `★ BONUS: ${bonusTargetId} — 2× Points (${remaining}s)`;
+    // Pulse effect
+    const intensity = 0.4 + 0.4 * Math.sin(bonusTimer * 4);
+    for (const tc of targetCircles) {
+      if (tc.bonusGlow) {
+        tc.mesh.material.emissiveIntensity = intensity;
+      }
+    }
+  }
+}
+
+function getTargetPoints(type, targetId) {
+  const base = TARGET_POINTS[type] || 1;
+  if (bonusActive && targetId === bonusTargetId) return base * 2;
+  return base;
+}
+
+// ===== Robot Builder =====
+function buildRobot(options) {
+  const { group, isPlayer } = options;
+  const h = config.heading * RAD;
+  const px = config.posX, pz = config.posZ;
+  const ph = config.pivotHeight;
+  const ll = config.leverLengthLoad, lc = config.leverLengthCW;
+
+  // Physics bodies
+  const mountBody = new CANNON.Body({ mass: 0 });
+  mountBody.type = CANNON.Body.KINEMATIC;
+  const cosH = Math.cos(h), sinH = Math.sin(h);
+  const pivotX = px + config.basePivotX * cosH + config.basePivotZ * sinH;
+  const pivotY = config.basePivotY;
+  const pivotZ = pz - config.basePivotX * sinH + config.basePivotZ * cosH;
+  mountBody.position.set(pivotX, pivotY, pivotZ);
+  const headingQuat = new CANNON.Quaternion();
+  headingQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
+  mountBody.quaternion.copy(headingQuat);
+  world.addBody(mountBody);
+
+  const armBody = new CANNON.Body({ mass: config.armMass });
+  armBody.addShape(new CANNON.Box(new CANNON.Vec3(0.025, 0.025, (ll + lc) / 2)));
+  armBody.position.set(pivotX, pivotY, pivotZ);
+  const tiltQuat = new CANNON.Quaternion();
+  const hingeAxis = new CANNON.Vec3(cosH, 0, -sinH);
+  tiltQuat.setFromAxisAngle(hingeAxis, -INITIAL_ARM_ANGLE);
+  armBody.quaternion = tiltQuat.mult(headingQuat);
+  armBody.sleepSpeedLimit = 0.1;
+  armBody.sleepTimeLimit = 0.5;
+  world.addBody(armBody);
+
+  const hinge = new CANNON.HingeConstraint(armBody, mountBody, {
+    pivotA: new CANNON.Vec3(0, 0, 0), pivotB: new CANNON.Vec3(0, 0, 0),
+    axisA: new CANNON.Vec3(1, 0, 0), axisB: new CANNON.Vec3(1, 0, 0),
+    motorEnabled: true, motorSpeed: 0, motorMaxForce: 10000,
+  });
+  world.addConstraint(hinge);
+
+  const ballRadius = 0.035;
+  const ballBody = new CANNON.Body({ mass: 0 });
+  ballBody.type = CANNON.Body.KINEMATIC;
+  ballBody.addShape(new CANNON.Sphere(ballRadius));
+  const armTipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -ll + config.ballOffsetZ);
+  const armTipWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(armTipLocal, armTipWorld);
+  armTipWorld.vadd(armBody.position, armTipWorld);
+  ballBody.position.copy(armTipWorld);
+  world.addBody(ballBody);
+
+  // Visuals
+  const baseGroup = new THREE.Group();
+  baseGroup.position.set(px, 0, pz);
+  baseGroup.rotation.y = h;
+  group.add(baseGroup);
+
+  const armGroup = new THREE.Group();
+  baseGroup.add(armGroup);
+
+  const tintColor = isPlayer ? 0x4488ff : 0xff4444;
+  const tintBase = isPlayer ? 0x445588 : 0x884444;
+
+  if (glbBase && glbArm) {
+    const baseClone = glbBase.clone(true);
+    baseClone.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    baseClone.traverse(c => { if (c.isMesh) c.material.color.setHex(tintBase); });
+    baseGroup.add(baseClone);
+
+    const armClone = glbArm.clone(true);
+    armClone.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    armClone.traverse(c => { if (c.isMesh) c.material.color.setHex(tintColor); });
+    armClone.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+    armGroup.add(armClone);
+  } else {
+    // Fallback procedural
+    const baseMat = new THREE.MeshStandardMaterial({ color: tintBase, roughness: 0.7, metalness: 0.3 });
+    const base = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.08, 0.6), baseMat);
+    base.position.set(0, 0.04, 0); base.castShadow = true;
+    baseGroup.add(base);
+
+    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x333333, roughness: 0.8 });
+    for (const wz of [-0.25, 0.25]) for (const wx of [-0.28, 0.28]) {
+      const w = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.07, 0.04, 12), wheelMat);
+      w.rotation.x = Math.PI / 2; w.position.set(wx, 0.04, wz);
+      baseGroup.add(w);
+    }
+    const postMat = new THREE.MeshStandardMaterial({ color: 0x667788, roughness: 0.5, metalness: 0.4 });
+    for (const side of [-1, 1]) {
+      const post = new THREE.Mesh(new THREE.BoxGeometry(0.04, ph, 0.04), postMat);
+      post.position.set(side * 0.08, ph / 2, 0);
+      baseGroup.add(post);
+    }
+    const armGeo = new THREE.BoxGeometry(0.03, 0.03, ll + lc);
+    armGeo.translate(0, 0, (lc - ll) / 2);
+    const armMesh = new THREE.Mesh(armGeo, new THREE.MeshStandardMaterial({ color: tintColor, roughness: 0.4, metalness: 0.5 }));
+    armMesh.castShadow = true;
+    armMesh.position.set(config.meshOffsetX, config.meshOffsetY, config.meshOffsetZ);
+    armGroup.add(armMesh);
+  }
+
+  // Ball visual
+  const ballMesh = new THREE.Mesh(
+    new THREE.SphereGeometry(ballRadius, 16, 16),
+    new THREE.MeshStandardMaterial({ color: isPlayer ? 0x4488ff : 0xff4444, roughness: 0.8, metalness: 0.0 })
+  );
+  ballMesh.castShadow = true;
+  group.add(ballMesh);
+
+  return { mountBody, armBody, ballBody, hinge, baseGroup, armGroup, ballMesh };
+}
+
+// ===== Create Player & Rival =====
+function createPlayerRobot() {
+  if (playerGroup) { scene.remove(playerGroup); cleanupRobotBodies(true); }
+  playerGroup = new THREE.Group();
+  scene.add(playerGroup);
+
+  // Player starts at left starting box
+  const savedX = config.posX, savedZ = config.posZ;
+  config.posX = -1.65;
+  config.posZ = 0.6;
+  const robot = buildRobot({ group: playerGroup, isPlayer: true });
+  playerMountBody = robot.mountBody;
+  playerArmBody = robot.armBody;
+  playerBallBody = robot.ballBody;
+  playerHinge = robot.hinge;
+  playerBaseGroup = robot.baseGroup;
+  playerArmGroup = robot.armGroup;
+  playerBallMesh = robot.ballMesh;
+  config.posX = savedX;
+  config.posZ = savedZ;
+  playerNavTarget = { x: savedX, z: savedZ, heading: config.heading };
+  playerReachedTarget = false;
+  playerHasFired = false;
+  return robot;
+}
+
+function createRivalRobot() {
+  if (rivalGroup) { scene.remove(rivalGroup); cleanupRobotBodies(false); }
+  rivalGroup = new THREE.Group();
+  scene.add(rivalGroup);
+
+  // Rival starts at right starting box; drives to center field
+  const rivalTargetX = 0;
+  const rivalTargetZ = 1.5;
+  const savedX = config.posX, savedZ = config.posZ, savedH = config.heading;
+  config.posX = 1.65;
+  config.posZ = 0.6;
+  config.heading = 0;
+  const robot = buildRobot({ group: rivalGroup, isPlayer: false });
+  rivalMountBody = robot.mountBody;
+  rivalArmBody = robot.armBody;
+  rivalBallBody = robot.ballBody;
+  rivalHinge = robot.hinge;
+  rivalBaseGroup = robot.baseGroup;
+  rivalArmGroup = robot.armGroup;
+  rivalBallMesh = robot.ballMesh;
+  config.posX = savedX;
+  config.posZ = savedZ;
+  config.heading = savedH;
+  rivalNavTarget = { x: rivalTargetX, z: rivalTargetZ, heading: 0 };
+  rivalReachedTarget = false;
+  rivalHasFired = false;
+  return robot;
+}
+
+function cleanupRobotBodies(isPlayer) {
+  const bodies = isPlayer
+    ? [playerMountBody, playerArmBody, playerBallBody]
+    : [rivalMountBody, rivalArmBody, rivalBallBody];
+  for (const b of bodies) { if (b) { world.removeBody(b); } }
+  if (isPlayer && playerHinge) world.removeConstraint(playerHinge);
+  if (!isPlayer && rivalHinge) world.removeConstraint(rivalHinge);
+}
+
+// ===== Mecanum Navigation =====
+function driveTo(armBody, mountBody, baseGroup, targetX, targetZ, targetHeadingDeg, dt) {
+  if (!armBody || !mountBody || !baseGroup) return false;
+
+  const curX = mountBody.position.x;
+  const curZ = mountBody.position.z;
+  const dx = targetX - curX;
+  const dz = targetZ - curZ;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+
+  if (dist < REACH_RADIUS) {
+    // Snap to final position
+    mountBody.position.set(targetX, mountBody.position.y, targetZ);
+    const headRad = targetHeadingDeg * RAD;
+    const hq = new CANNON.Quaternion();
+    hq.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), headRad);
+    mountBody.quaternion.copy(hq);
+
+    // Sync visual
+    const px2 = targetX, pz2 = targetZ;
+    const cosH2 = Math.cos(headRad), sinH2 = Math.sin(headRad);
+    const pivotX2 = px2 + config.basePivotX * cosH2 + config.basePivotZ * sinH2;
+    const pivotZ2 = pz2 - config.basePivotX * sinH2 + config.basePivotZ * cosH2;
+    armBody.position.set(pivotX2, armBody.position.y, pivotZ2);
+    // Recompute arm quaternion with new heading
+    const tiltQ = new CANNON.Quaternion();
+    const hingeAx = new CANNON.Vec3(cosH2, 0, -sinH2);
+    tiltQ.setFromAxisAngle(hingeAx, -INITIAL_ARM_ANGLE);
+    const hq2 = new CANNON.Quaternion();
+    hq2.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), headRad);
+    armBody.quaternion = tiltQ.mult(hq2);
+
+    // Sync visual groups
+    baseGroup.position.set(px2, 0, pz2);
+    baseGroup.rotation.y = headRad;
+    return true; // reached
+  }
+
+  // Move toward target at NAV_SPEED
+  const speed = NAV_SPEED;
+  const step = speed * dt;
+  const frac = Math.min(step / dist, 1);
+  const newX = lerp(curX, targetX, frac);
+  const newZ = lerp(curZ, targetZ, frac);
+  mountBody.position.set(newX, mountBody.position.y, newZ);
+
+  // Compute heading to face target direction AND board center
+  const headingTarget = targetHeadingDeg;
+  const curHeading = baseGroup.rotation.y / RAD;
+  const headingDiff = headingTarget - curHeading;
+  const wrappedDiff = ((headingDiff + 180) % 360 + 360) % 360 - 180;
+  const maxHeadingStep = NAV_HEADING_SPEED * dt * (180 / Math.PI);
+  const newHeading = curHeading + clamp(wrappedDiff, -maxHeadingStep, maxHeadingStep);
+
+  const newHeadingRad = newHeading * RAD;
+  const hq3 = new CANNON.Quaternion();
+  hq3.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), newHeadingRad);
+  mountBody.quaternion.copy(hq3);
+
+  // Update arm position to stay at pivot relative to new base position
+  const cosH3 = Math.cos(newHeadingRad), sinH3 = Math.sin(newHeadingRad);
+  const pivotX3 = newX + config.basePivotX * cosH3 + config.basePivotZ * sinH3;
+  const pivotZ3 = newZ - config.basePivotX * sinH3 + config.basePivotZ * cosH3;
+  armBody.position.set(pivotX3, armBody.position.y, pivotZ3);
+
+  const tiltQ3 = new CANNON.Quaternion();
+  const hingeAx3 = new CANNON.Vec3(cosH3, 0, -sinH3);
+  tiltQ3.setFromAxisAngle(hingeAx3, -INITIAL_ARM_ANGLE);
+  const hq4 = new CANNON.Quaternion();
+  hq4.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), newHeadingRad);
+  armBody.quaternion = tiltQ3.mult(hq4);
+
+  // Sync visual groups
+  baseGroup.position.set(newX, 0, newZ);
+  baseGroup.rotation.y = newHeadingRad;
+
+  return false; // still moving
+}
+
+function checkRivalBlocking() {
+  if (!rivalArmBody) return false;
+  const targetX = config.posX, targetZ = config.posZ;
+  const rx = rivalMountBody.position.x;
+  const rz = rivalMountBody.position.z;
+  const dx = targetX - rx, dz = targetZ - rz;
+  const dist = Math.sqrt(dx * dx + dz * dz);
+  return dist < RIVAL_BLOCK_RADIUS;
+}
+
+function recalcPlayerPosition() {
+  // Shift laterally by RECALC_SHIFT
+  const newX = config.posX + (config.posX >= 0 ? RECALC_SHIFT : -RECALC_SHIFT);
+  // Clamp to robot zone
+  const clampedX = clamp(newX, -1.8, 1.8);
+  // Recalculate heading to face board center (0, 7.5) from new position
+  const dz2 = BOARD.centerZ - config.posZ;
+  const dx2 = BOARD.centerX - clampedX;
+  const newHeading = Math.atan2(dx2, dz2) / RAD;
+
+  config.posX = clampedX;
+  config.heading = newHeading;
+  playerNavTarget = { x: clampedX, z: config.posZ, heading: newHeading };
+  playerReachedTarget = false;
+  log(`⚠ Rival blocking! Recalibrating to X=${clampedX.toFixed(2)}, heading=${newHeading.toFixed(1)}°`);
+}
+
+// ===== Fire / Release =====
+function fireRobot(isPlayer) {
+  const armBody = isPlayer ? playerArmBody : rivalArmBody;
+  const hinge = isPlayer ? playerHinge : rivalHinge;
+  if (!armBody || !hinge) return;
+  if (isPlayer) {
+    if (playerFired || playerBalls <= 0) return;
+    playerBalls--;
+    playerFired = true;
+    playerReleased = false;
+    playerLanded = false;
+    playerHasHit = false;
+    playerTrailPoints = [];
+    playerBoardCrossY = null;
+    playerBoardCrossVx = playerBoardCrossVy = playerBoardCrossVz = null;
+    playerFiredTime = clock.elapsedTime;
+    playerFiredWallTime = Date.now();
+    updateBallDisplay();
+    log(`Player fires! (${playerBalls} balls remaining)`);
+  } else {
+    if (rivalFired || rivalBalls <= 0) return;
+    rivalBalls--;
+    rivalFired = true;
+    rivalReleased = false;
+    rivalLanded = false;
+    rivalHasHit = false;
+    rivalTrailPoints = [];
+    rivalBoardCrossY = null;
+    rivalBoardCrossVx = rivalBoardCrossVy = rivalBoardCrossVz = null;
+    rivalFiredTime = clock.elapsedTime;
+    rivalFiredWallTime = Date.now();
+    updateBallDisplay();
+    log(`Rival fires! (${rivalBalls} balls remaining)`);
+  }
+  world.gravity.set(0, -9.82, 0);
+  armBody.wakeUp();
+  armBody.sleepSpeedLimit = -1;
+  hinge.enableMotor();
+  hinge.setMotorSpeed(30);
+  hinge.motorMaxForce = config.motorTorque;
+  if (isPlayer) {
+    log('Player trebuchet fired!');
+  } else {
+    log('Rival trebuchet fired!');
+  }
+}
+
+function updateCatapultBall(isPlayer) {
+  const armBody = isPlayer ? playerArmBody : rivalArmBody;
+  const ballBody = isPlayer ? playerBallBody : rivalBallBody;
+  if (!armBody || !ballBody) return;
+  const tipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+  const tipWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(tipLocal, tipWorld);
+  tipWorld.vadd(armBody.position, tipWorld);
+  ballBody.position.copy(tipWorld);
+}
+
+function checkRelease(isPlayer) {
+  const armBody = isPlayer ? playerArmBody : rivalArmBody;
+  const ballBody = isPlayer ? playerBallBody : rivalBallBody;
+  const hinge = isPlayer ? playerHinge : rivalHinge;
+  const mountBody = isPlayer ? playerMountBody : rivalMountBody;
+  const fired = isPlayer ? playerFired : rivalFired;
+  const released = isPlayer ? playerReleased : rivalReleased;
+
+  if (!fired || released || !armBody || !mountBody) return;
+  // Extract actual heading from mountBody quaternion
+  const mq = mountBody.quaternion;
+  const h = Math.atan2(
+    2 * (mq.y * mq.w - mq.x * mq.z),
+    1 - 2 * (mq.y * mq.y + mq.z * mq.z)
+  );
+  const hingeAxis = new CANNON.Vec3(Math.cos(h), 0, -Math.sin(h));
+  const initQuat = new CANNON.Quaternion();
+  initQuat.setFromAxisAngle(hingeAxis, -INITIAL_ARM_ANGLE);
+  const headQuat = new CANNON.Quaternion();
+  headQuat.setFromAxisAngle(new CANNON.Vec3(0, 1, 0), h);
+  const fullInit = initQuat.mult(headQuat);
+  const localDir = new CANNON.Vec3(0, 0, -1);
+  const initWorld = new CANNON.Vec3();
+  fullInit.vmult(localDir, initWorld);
+  const curWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(localDir, curWorld);
+
+  function proj(v) {
+    const d = v.dot(hingeAxis);
+    return new CANNON.Vec3(v.x - d * hingeAxis.x, v.y - d * hingeAxis.y, v.z - d * hingeAxis.z);
+  }
+  const initP = proj(initWorld).unit();
+  const curP = proj(curWorld).unit();
+  const cross = new CANNON.Vec3();
+  initP.cross(curP, cross);
+  const angle = Math.atan2(cross.dot(hingeAxis), initP.dot(curP)) * (180 / Math.PI);
+
+  if (angle >= config.releaseAngle) {
+    if (isPlayer) playerReleased = true;
+    else rivalReleased = true;
+    if (hinge) hinge.disableMotor();
+    if (ballBody && armBody) {
+      const tipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -config.leverLengthLoad + config.ballOffsetZ);
+      const rWorld = new CANNON.Vec3();
+      armBody.vectorToWorldFrame(tipLocal, rWorld);
+      const tipVel = new CANNON.Vec3();
+      armBody.angularVelocity.cross(rWorld, tipVel);
+      tipVel.vadd(armBody.velocity, tipVel);
+      ballBody.velocity.copy(tipVel);
+      ballBody.type = CANNON.Body.DYNAMIC;
+      ballBody.mass = 0.03;
+      ballBody.updateMassProperties();
+      ballBody.wakeUp();
+    }
+    log(`Ball released! (${isPlayer ? 'Player' : 'Rival'})`);
+  }
+}
+
+// ===== Scoring =====
+function checkTargetHit(isPlayer) {
+  const ballBody = isPlayer ? playerBallBody : rivalBallBody;
+  const released = isPlayer ? playerReleased : rivalReleased;
+  const hasHit = isPlayer ? playerHasHit : rivalHasHit;
+
+  if (!released || !ballBody || hasHit) return;
+  const ballPos = ballBody.position;
+  const bv = new THREE.Vector3(ballPos.x, ballPos.y, ballPos.z);
+  const localPos = new THREE.Vector3();
+  boardGroup.worldToLocal(localPos.copy(bv));
+  if (Math.abs(localPos.z) > 0.08) return;
+
+  for (const tc of targetCircles) {
+    if (tc.data.hit) continue;
+    const dx = localPos.x - tc.data.x;
+    const dy = localPos.y - tc.data.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist <= tc.data.r) {
+      tc.data.hit = true;
+      if (tc.data.type === 'bonus') {
+        tc.mesh.material.color.setHex(0x44ff88);
+        tc.mesh.material.emissive.setHex(0x22ff44);
+        tc.mesh.material.emissiveIntensity = 0.6;
+      } else {
+        tc.mesh.material.color.setHex(0x44ff88);
+        tc.mesh.material.emissive.setHex(0x22ff44);
+        tc.mesh.material.emissiveIntensity = 0.3;
+      }
+      hitTargets.push(tc.data);
+      if (isPlayer) playerHasHit = true;
+      else rivalHasHit = true;
+
+      const pts = getTargetPoints(tc.data.type, tc.data.id);
+      if (isPlayer) { playerScore += pts; updatePlayerScore(); }
+      else { rivalScore += pts; updateRivalScore(); }
+
+      const bonusLabel = (bonusActive && tc.data.id === bonusTargetId) ? ' [2× BONUS!]' : '';
+      log(`🎯 ${isPlayer ? 'Player' : 'Rival'} hit ${tc.data.id}${bonusLabel} +${pts} pts`, true);
+      return;
+    }
+  }
+}
+
+function checkLanding(isPlayer) {
+  const ballBody = isPlayer ? playerBallBody : rivalBallBody;
+  const released = isPlayer ? playerReleased : rivalReleased;
+  const landed = isPlayer ? playerLanded : rivalLanded;
+  if (!released || landed || !ballBody) return;
+  const pos = ballBody.position;
+  const wallElapsed = Date.now() - (isPlayer ? playerFiredWallTime : rivalFiredWallTime);
+  const vel = ballBody.velocity;
+  const settled = pos.y < 0.12 && vel.length() < 0.4 && wallElapsed > 1000;
+  if (pos.y < -0.5 || pos.y > 15 || Math.abs(pos.x) > 15 || pos.z > 25 || pos.z < -5 || wallElapsed > 5000 || settled) {
+    if (isPlayer) playerLanded = true;
+    else rivalLanded = true;
+    if (!(isPlayer ? playerHasHit : rivalHasHit)) {
+      log(`${isPlayer ? 'Player' : 'Rival'} ball missed all targets.`);
+    }
+    // Auto-reload: schedule next shot if balls remain
+    const ballsLeft = isPlayer ? playerBalls : rivalBalls;
+    if (ballsLeft > 0 && gameState !== STATE.ENDED) {
+      setTimeout(() => reloadAndFire(isPlayer), 800);
+    } else if (ballsLeft <= 0) {
+      log(`${isPlayer ? 'Player' : 'Rival'} out of balls!`);
+    }
+  }
+}
+
+function reloadAndFire(isPlayer) {
+  if (gameState === STATE.ENDED || gameState === STATE.WAITING) return;
+  const ballsLeft = isPlayer ? playerBalls : rivalBalls;
+  if (ballsLeft <= 0) return;
+  // Reset fire state so robot can shoot again
+  if (isPlayer) {
+    playerFired = false;
+    playerReleased = false;
+    playerLanded = false;
+    playerHasHit = false;
+    playerTrailPoints = [];
+    playerBoardCrossY = null;
+    playerBoardCrossVx = playerBoardCrossVy = playerBoardCrossVz = null;
+  } else {
+    rivalFired = false;
+    rivalReleased = false;
+    rivalLanded = false;
+    rivalHasHit = false;
+    rivalTrailPoints = [];
+    rivalBoardCrossY = null;
+    rivalBoardCrossVx = rivalBoardCrossVy = rivalBoardCrossVz = null;
+  }
+  // Clear old trail
+  if (trailData) {
+    const td = isPlayer ? trailData.player : trailData.rival;
+    td.line.geometry.setDrawRange(0, 0);
+  }
+  // Create new ball at arm tip
+  resetRobotBall(isPlayer);
+  // Re-engage motor to hold arm at cocked position
+  const hinge = isPlayer ? playerHinge : rivalHinge;
+  if (hinge) {
+    hinge.enableMotor();
+    hinge.setMotorSpeed(0);
+  }
+  // Fire next ball after a brief reload delay
+  setTimeout(() => fireRobot(isPlayer), 300);
+}
+
+// ===== Trajectory Trails =====
+function buildTrails() {
+  if (playerTrailLine) { scene.remove(playerTrailLine); playerTrailLine.geometry.dispose(); }
+  if (rivalTrailLine) { scene.remove(rivalTrailLine); rivalTrailLine.geometry.dispose(); }
+  const MAX = 800;
+  function makeTrail(color) {
+    const buf = new Float32Array(MAX * 3);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(buf, 3));
+    geo.setDrawRange(0, 0);
+    const mat = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.7 });
+    const line = new THREE.Line(geo, mat);
+    scene.add(line);
+    return { line, buf, MAX };
+  }
+  return {
+    player: makeTrail(0x4488ff),
+    rival: makeTrail(0xff4444),
+  };
+}
+let trailData;
+
+function updateTrail(isPlayer, points) {
+  if (!trailData) return;
+  const td = isPlayer ? trailData.player : trailData.rival;
+  if (points.length === 0) return;
+  const totalFloats = points.length;
+  const count = Math.min(totalFloats / 3, td.MAX);
+  const skip = totalFloats > td.MAX * 3 ? totalFloats - td.MAX * 3 : 0;
+  for (let i = 0; i < count * 3; i++) {
+    td.buf[i] = points[skip + i];
+  }
+  td.line.geometry.attributes.position.needsUpdate = true;
+  td.line.geometry.setDrawRange(0, count);
+}
+
+// ===== Sync Physics to Visuals =====
+function syncRobotVisuals(isPlayer) {
+  const armBody = isPlayer ? playerArmBody : rivalArmBody;
+  const mountBody = isPlayer ? playerMountBody : rivalMountBody;
+  const ballBody = isPlayer ? playerBallBody : rivalBallBody;
+  const ballMesh = isPlayer ? playerBallMesh : rivalBallMesh;
+  const baseGroup = isPlayer ? playerBaseGroup : rivalBaseGroup;
+  const armGroup = isPlayer ? playerArmGroup : rivalArmGroup;
+
+  if (!armBody || !mountBody || !baseGroup || !armGroup) return;
+
+  const worldPos = new THREE.Vector3(armBody.position.x, armBody.position.y, armBody.position.z);
+  baseGroup.worldToLocal(armGroup.position.copy(worldPos));
+
+  // Extract tilt-only rotation (baseGroup provides the heading)
+  const tiltOnly = new THREE.Quaternion().copy(armBody.quaternion);
+  // Compute actual heading from mountBody quaternion
+  const mq = mountBody.quaternion;
+  const actualHeading = Math.atan2(
+    2 * (mq.y * mq.w - mq.x * mq.z),
+    1 - 2 * (mq.y * mq.y + mq.z * mq.z)
+  );
+  const invHeading = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -actualHeading);
+  tiltOnly.multiply(invHeading);
+  armGroup.quaternion.copy(tiltOnly);
+
+  if (ballBody && ballMesh) {
+    ballMesh.position.copy(ballBody.position);
+    ballMesh.quaternion.copy(ballBody.quaternion);
+  }
+}
+
+// ===== Game State Machine =====
+function startMatch() {
+  if (gameState !== STATE.WAITING) return;
+  document.getElementById('btn-start').disabled = true;
+  waitingCountdown = 5;
+  log('Match starting... 5 second countdown.');
+  tipEl.innerHTML = 'Match starting in <span class="highlight">5</span>...';
+  setTimeout(() => {
+    // Transition to FIRST_HALF
+    gameState = STATE.FIRST_HALF;
+    matchTimer = 0;
+    halfCounter = 1;
+    playerHasFired = false;
+    rivalHasFired = false;
+    pickBonusTarget();
+    phaseEl.textContent = 'FIRST HALF — AI Control';
+    phaseEl.className = 'phase match';
+    timerEl.textContent = '03:00';
+    tipEl.textContent = '⚡ AI Control Phase — Robot navigating to position';
+    setStatus('AI Control: Robot is navigating to launch position.');
+    log('=== FIRST HALF STARTED (3:00) ===');
+
+    // Set navigation targets
+    const headRad = Math.atan2(BOARD.centerX - config.posX, BOARD.centerZ - config.posZ) / RAD;
+    playerNavTarget = { x: config.posX, z: config.posZ, heading: headRad };
+    playerReachedTarget = false;
+    // Rival drives to its own lane on the right side
+    const rivalHead = Math.atan2(BOARD.centerX - rivalConfig.posX, BOARD.centerZ - rivalConfig.posZ) / RAD;
+    rivalNavTarget = { x: rivalConfig.posX, z: rivalConfig.posZ, heading: rivalHead };
+    rivalReachedTarget = false;
+
+    // Enable physics
+    world.gravity.set(0, -9.82, 0);
+    log('Gravity enabled.');
+  }, 5000);
+}
+
+function updateGame(dt) {
+  if (gameState === STATE.WAITING) {
+    // Robots are locked in starting boxes, no physics
+    tipEl.style.opacity = 1;
+    return;
+  }
+
+  if (gameState === STATE.FIRST_HALF || gameState === STATE.SECOND_HALF) {
+    matchTimer += dt;
+    updateBonusTimer(dt);
+
+    const remaining = Math.max(0, halfDuration - matchTimer);
+    const mins = Math.floor(remaining / 60);
+    const secs = Math.floor(remaining % 60);
+    timerEl.textContent = `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+
+    // Check if half ended
+    if (matchTimer >= halfDuration) {
+      if (gameState === STATE.FIRST_HALF) {
+        gameState = STATE.SECOND_HALF;
+        matchTimer = 0;
+        halfCounter = 2;
+        pickBonusTarget();
+        phaseEl.textContent = 'SECOND HALF — 1v1 Match';
+        phaseEl.className = 'phase overtime';
+        tipEl.textContent = '⚔ 1v1 Match Phase — Both robots fire!';
+        setStatus('1v1 Match: Both robots are firing.');
+        log('=== SECOND HALF STARTED (3:00) — 1v1 MATCH ===');
+
+        // Navigate player back to position (may have moved)
+        playerNavTarget = { x: config.posX, z: config.posZ, heading: config.heading };
+        playerReachedTarget = false;
+        playerHasFired = false;
+        playerFired = false;
+        playerReleased = false;
+        playerLanded = false;
+        playerHasHit = false;
+        rivalHasFired = false;
+        rivalFired = false;
+        rivalReleased = false;
+        rivalLanded = false;
+        rivalHasHit = false;
+
+        // Reset ball bodies + refill balls for second half
+        playerBalls = MAX_BALLS;
+        rivalBalls = MAX_BALLS;
+        updateBallDisplay();
+        resetRobotBalls(true);
+        resetRobotBalls(false);
+
+        // Rival also navigates to its own lane
+        const rivalHead2 = Math.atan2(BOARD.centerX - rivalConfig.posX, BOARD.centerZ - rivalConfig.posZ) / RAD;
+        rivalNavTarget = { x: rivalConfig.posX, z: rivalConfig.posZ, heading: rivalHead2 };
+        rivalReachedTarget = false;
+      } else {
+        gameState = STATE.ENDED;
+        phaseEl.textContent = 'MATCH ENDED';
+        timerEl.textContent = '00:00';
+        tipEl.textContent = `🏆 Match Over! Player: ${playerScore} | Rival: ${rivalScore}`;
+        setStatus('Match ended. Check scores.');
+        log('=== MATCH ENDED ===');
+        if (playerScore > rivalScore) {
+          log(`🏆 PLAYER WINS! ${playerScore} - ${rivalScore}`);
+        } else if (rivalScore > playerScore) {
+          log(`🏆 RIVAL WINS! ${rivalScore} - ${playerScore}`);
+        } else {
+          log(`🤝 TIE! ${playerScore} - ${rivalScore}`);
+        }
+        return;
+      }
+    }
+
+    // === Keyboard Driving (manual override) ===
+    if (gameState === STATE.FIRST_HALF || gameState === STATE.SECOND_HALF) {
+      let moved = false;
+      const speed = NAV_SPEED * dt;
+      const rotSpeed = 60 * dt; // degrees/sec
+      const headingRad = config.heading * RAD;
+
+      if (keys['w'] || keys['arrowup']) {
+        config.posX += Math.sin(headingRad) * speed;
+        config.posZ += Math.cos(headingRad) * speed;
+        moved = true;
+      }
+      if (keys['s'] || keys['arrowdown']) {
+        config.posX -= Math.sin(headingRad) * speed;
+        config.posZ -= Math.cos(headingRad) * speed;
+        moved = true;
+      }
+      if (keys['a'] || keys['arrowleft']) {
+        config.heading -= rotSpeed;
+        moved = true;
+      }
+      if (keys['d'] || keys['arrowright']) {
+        config.heading += rotSpeed;
+        moved = true;
+      }
+
+      if (moved) {
+        config.posX = Math.max(-1.8, Math.min(1.8, config.posX));
+        config.posZ = Math.max(0.5, Math.min(4.5, config.posZ));
+        const headRad = Math.atan2(BOARD.centerX - config.posX, BOARD.centerZ - config.posZ);
+        playerNavTarget = { x: config.posX, z: config.posZ, heading: headRad / RAD };
+        playerReachedTarget = false;
+        setStatus('Manual control — use WASD to drive.');
+      }
+    }
+
+    // === AI Navigation ===
+    // Player: drive to target position
+    if (playerNavTarget && !playerReachedTarget) {
+      // Check if rival is blocking
+      if (checkRivalBlocking() && !playerReachedTarget) {
+        recalcPlayerPosition();
+      }
+
+      const reached = driveTo(
+        playerArmBody, playerMountBody,
+        playerBaseGroup, // baseGroup
+        playerNavTarget.x, playerNavTarget.z,
+        playerNavTarget.heading, dt
+      );
+      if (reached) {
+        playerReachedTarget = true;
+        setStatus('Robot in position. Firing...');
+        log('Player robot reached position. Firing.');
+
+        // Fire after short delay
+        setTimeout(() => {
+          fireRobot(true);
+        }, 500);
+      }
+    }
+
+    // Rival: drive to center
+    if (rivalNavTarget && !rivalReachedTarget && rivalMountBody) {
+      const reached = driveTo(
+        rivalArmBody, rivalMountBody,
+        rivalBaseGroup,
+        rivalNavTarget.x, rivalNavTarget.z,
+        rivalNavTarget.heading, dt
+      );
+      if (reached) {
+        rivalReachedTarget = true;
+        log('Rival robot reached position. Firing.');
+        setTimeout(() => {
+          fireRobot(false);
+        }, 800);
+      }
+    }
+
+    // If player already reached but hasn't fired, fire now (belt + suspenders)
+    if (playerReachedTarget && !playerFired && playerArmBody) {
+      fireRobot(true);
+    }
+    if (rivalReachedTarget && !rivalFired && rivalArmBody) {
+      fireRobot(false);
+    }
+  }
+}
+
+function resetRobotBalls(isPlayer) {
+  const armBody = isPlayer ? playerArmBody : rivalArmBody;
+  const ballBody = isPlayer ? playerBallBody : rivalBallBody;
+  if (!armBody || !ballBody) return;
+  world.removeBody(ballBody);
+  const ll = config.leverLengthLoad;
+  const tipLocal = new CANNON.Vec3(config.ballOffsetX, config.ballOffsetY, -ll + config.ballOffsetZ);
+  const tipWorld = new CANNON.Vec3();
+  armBody.vectorToWorldFrame(tipLocal, tipWorld);
+  tipWorld.vadd(armBody.position, tipWorld);
+  const newBall = new CANNON.Body({ mass: 0 });
+  newBall.type = CANNON.Body.KINEMATIC;
+  newBall.addShape(new CANNON.Sphere(0.035));
+  newBall.position.copy(tipWorld);
+  world.addBody(newBall);
+  if (isPlayer) { playerBallBody = newBall; }
+  else { rivalBallBody = newBall; }
+}
+function resetRobotBall(isPlayer) { resetRobotBalls(isPlayer); }
+
+// ===== Full Reset =====
+function fullReset() {
+  gameState = STATE.WAITING;
+  matchTimer = 0;
+  halfCounter = 0;
+  playerScore = 0;
+  rivalScore = 0;
+  playerBalls = MAX_BALLS;
+  rivalBalls = MAX_BALLS;
+  playerHasFired = false;
+  rivalHasFired = false;
+  bonusActive = false;
+  bonusTargetId = null;
+  bonusTimer = 0;
+  updatePlayerScore();
+  updateRivalScore();
+  updateBallDisplay();
+  bonusIndicator.classList.remove('active');
+  logEl.innerHTML = '';
+
+  phaseEl.textContent = 'WAITING';
+  phaseEl.className = 'phase waiting';
+  timerEl.textContent = '--:--';
+  tipEl.textContent = 'Get ready for the match!';
+  tipEl.style.opacity = 1;
+  setStatus('Match reset. Press START MATCH.');
+  document.getElementById('btn-start').disabled = false;
+
+  world.gravity.set(0, 0, 0);
+
+  // Rebuild robots
+  createPlayerRobot();
+  createRivalRobot();
+
+  // Reset target colors
+  for (const tc of targetCircles) {
+    tc.mesh.material.color.copy(tc.origMat.color);
+    tc.mesh.material.emissive.copy(tc.origMat.emissive);
+    tc.mesh.material.emissiveIntensity = tc.origMat.emissiveIntensity;
+    tc.data.hit = false;
+    tc.bonusGlow = false;
+  }
+  hitTargets = [];
+
+  // Reset trails
+  if (trailData) {
+    for (const key of ['player', 'rival']) {
+      const td = trailData[key];
+      td.line.geometry.setDrawRange(0, 0);
+    }
+  }
+  log('Competition arena reset.');
+}
+
+// ===== GUI =====
+function initGUI() {
+  const gui = new GUI({ title: 'Competition Controls', width: 300 });
+  gui.domElement.style.fontSize = '13px';
+
+  const posFolder = gui.addFolder('Robot Position & Heading');
+  posFolder.add(config, 'posX', -1.8, 1.8, 0.01).name('Target Pos X (m)');
+  posFolder.add(config, 'posZ', 0.5, 4.5, 0.01).name('Target Pos Z (m)');
+  posFolder.add(config, 'heading', -20, 20, 1).name('Heading (deg)');
+  posFolder.open();
+
+  const mechFolder = gui.addFolder('Mechanism');
+  mechFolder.add(config, 'pivotHeight', 0.3, 2.0, 0.01).name('Pivot Height (m)');
+  mechFolder.add(config, 'leverLengthLoad', 0.3, 2.0, 0.01).name('Lever Load (m)');
+  mechFolder.add(config, 'leverLengthCW', 0.2, 1.5, 0.01).name('Lever CW (m)');
+  mechFolder.add(config, 'motorTorque', 5, 200, 0.5).name('Motor Torque (Nm)');
+  mechFolder.open();
+
+  const projFolder = gui.addFolder('Projectile & Release');
+  projFolder.add(config, 'releaseAngle', 30, 100, 1).name('Release Angle (°)');
+  projFolder.open();
+
+  const massFolder = gui.addFolder('Robot Mass');
+  massFolder.add(config, 'armMass', 1, 15, 0.5).name('Arm Mass (kg)');
+  massFolder.add(config, 'baseMass', 1, 15, 0.5).name('Base Mass (kg)');
+  massFolder.open();
+
+  const views = {
+    'Default View': () => {
+      camera.position.set(8, 7, 6);
+      controls.target.set(0, 1.5, 4);
+      controls.update();
+    },
+    'Top View': () => {
+      camera.position.set(0, 12, 4);
+      controls.target.set(0, 0.5, 4);
+      controls.update();
+    },
+    'Side View': () => {
+      camera.position.set(12, 4, 4);
+      controls.target.set(0, 1, 4);
+      controls.update();
+    },
+  };
+  const viewFolder = gui.addFolder('Camera Views');
+  viewFolder.add(views, 'Default View').name('Default');
+  viewFolder.add(views, 'Top View').name('Top');
+  viewFolder.add(views, 'Side View').name('Side');
+  viewFolder.open();
+
+  return gui;
+}
+
+// ===== GLB Loading =====
+function loadGLBModels() {
+  glbLoader.load(MODEL_PATH + 'robot_base.glb', (gltf) => {
+    glbBase = gltf.scene;
+    glbBase.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    glbBase.rotation.x = Math.PI / 2;
+    glbBase.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    if (gameState === STATE.WAITING) fullReset();
+  }, undefined, () => { glbBase = null; });
+  glbLoader.load(MODEL_PATH + 'robot_arm.glb', (gltf) => {
+    glbArm = gltf.scene;
+    glbArm.scale.set(config.modelScale, config.modelScale, config.modelScale);
+    glbArm.rotation.x = -48 * RAD;
+    glbArm.rotation.z = -Math.PI / 2;
+    glbArm.rotation.y = Math.PI;
+    glbArm.traverse(c => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    if (gameState === STATE.WAITING) fullReset();
+  }, undefined, () => { glbArm = null; });
+}
+
+// ===== Main Loop =====
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.033);
+
+  // Update game state
+  updateGame(dt);
+
+  // Physics stepping (only when game is active)
+  if (gameState !== STATE.WAITING) {
+    const steps = 1;
+    for (let s = 0; s < steps; s++) {
+      // Fire checks: motor-driven arm ball following
+      if (playerFired && !playerReleased && playerArmBody && playerBallBody) updateCatapultBall(true);
+      if (rivalFired && !rivalReleased && rivalArmBody && rivalBallBody) updateCatapultBall(false);
+
+      if (world) world.step(1 / 60);
+
+      if (playerFired && !playerReleased) checkRelease(true);
+      if (rivalFired && !rivalReleased) checkRelease(false);
+
+      // Track board crossing
+      if (playerReleased && !playerLanded && playerBallBody) {
+        if (playerBoardCrossY === null) {
+          const bz = playerBallBody.position.z;
+          if (bz >= BOARD.centerZ - 0.15 && bz <= BOARD.centerZ + 0.15) {
+            playerBoardCrossY = playerBallBody.position.y;
+            playerBoardCrossVx = playerBallBody.velocity.x;
+            playerBoardCrossVy = playerBallBody.velocity.y;
+            playerBoardCrossVz = playerBallBody.velocity.z;
+          }
+        }
+        checkTargetHit(true);
+        checkLanding(true);
+      }
+      if (rivalReleased && !rivalLanded && rivalBallBody) {
+        if (rivalBoardCrossY === null) {
+          const bz2 = rivalBallBody.position.z;
+          if (bz2 >= BOARD.centerZ - 0.15 && bz2 <= BOARD.centerZ + 0.15) {
+            rivalBoardCrossY = rivalBallBody.position.y;
+            rivalBoardCrossVx = rivalBallBody.velocity.x;
+            rivalBoardCrossVy = rivalBallBody.velocity.y;
+            rivalBoardCrossVz = rivalBallBody.velocity.z;
+          }
+        }
+        checkTargetHit(false);
+        checkLanding(false);
+      }
+    }
+  }
+
+  // Sync visuals
+  syncRobotVisuals(true);
+  syncRobotVisuals(false);
+
+  // Update trails
+  if (playerReleased && playerBallBody) {
+    playerTrailPoints.push(playerBallBody.position.x, playerBallBody.position.y, playerBallBody.position.z);
+    updateTrail(true, playerTrailPoints);
+  }
+  if (rivalReleased && rivalBallBody) {
+    rivalTrailPoints.push(rivalBallBody.position.x, rivalBallBody.position.y, rivalBallBody.position.z);
+    updateTrail(false, rivalTrailPoints);
+  }
+
+  controls.update();
+  renderer.render(scene, camera);
+  clock.start(); // prevent dt from accumulating
+}
+
+// ===== Event Bindings =====
+document.getElementById('btn-start').addEventListener('click', startMatch);
+document.getElementById('btn-reset').addEventListener('click', fullReset);
+
+// ===== Keyboard Controls =====
+document.addEventListener('keydown', (e) => {
+  const key = e.key;
+  keys[key.toLowerCase()] = true;
+
+  if (key === ' ' || key === 'Space') {
+    e.preventDefault();
+    if (gameState === STATE.WAITING) {
+      startMatch();
+    } else if ((gameState === STATE.FIRST_HALF || gameState === STATE.SECOND_HALF) && !playerFired) {
+      // Manual fire override: set target to current position and fire
+      const headRad = Math.atan2(BOARD.centerX - config.posX, BOARD.centerZ - config.posZ);
+      playerNavTarget = { x: config.posX, z: config.posZ, heading: headRad / RAD };
+      playerReachedTarget = false;
+      setTimeout(() => {
+        if (!playerFired) fireRobot(true);
+      }, 300);
+    }
+  }
+  else if (key === 'r' || key === 'R') { fullReset(); }
+  else if ((key === 't' || key === 'T') && !e.ctrlKey && !e.metaKey) {
+    camera.position.set(0, 12, 4); controls.target.set(0, 0.5, 4); controls.update();
+  }
+  else if (key === 's' || key === 'S') {
+    camera.position.set(12, 4, 4); controls.target.set(0, 1, 4); controls.update();
+  }
+  else if (key === '1') {
+    camera.position.set(8, 7, 6); controls.target.set(0, 1.5, 4); controls.update();
+  }
+});
+document.addEventListener('keyup', (e) => {
+  keys[e.key.toLowerCase()] = false;
+});
+
+// ===== START =====
+initScene();
+initPhysics();
+buildArena();
+buildFieldBarriers();
+buildStartingBoxes();
+buildTargetBoard();
+createPlayerRobot();
+createRivalRobot();
+trailData = buildTrails();
+initGUI();
+loadGLBModels();
+
+log('Competition Arena loaded. [Space] Start/Fire | WASD Drive | [R] Reset');
+setStatus('Ready. [Space] START MATCH, WASD to drive.');
+
+animate();
+
+// Expose for debugging
+window.config = config;
+</script>
+</body>
+</html>
