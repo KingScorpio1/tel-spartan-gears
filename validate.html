@@ -159,13 +159,13 @@ const FEASIBLE = {
   posX: [0, 0],
   posZ: [2.5, 2.5],
   heading: [-20, 20],
-  pivotHeight: [0.5, 1.5],
+  pivotHeight: [0.3, 2.5],
   motorTorque: [5, 200],
-  leverLengthLoad: [0.4, 1.8],
-  leverLengthCW: [0.2, 1.0],
+  leverLengthLoad: [0.4, 3.0],
+  leverLengthCW: [0.2, 2.0],
   releaseAngle: [75, 115],
 };
-const FIXED_PARAMS = new Set(['posX', 'posZ', 'pivotHeight', 'leverLengthLoad', 'leverLengthCW']);
+const FIXED_PARAMS = new Set(['posX', 'posZ']);
 
 // ===== Target Board Geometry =====
 const BOARD = {
@@ -1219,13 +1219,15 @@ function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function launchVelocity(params) {
   const g = 9.82, mp = 0.03, armM = config.armMass || 2;
   const ll = params.leverLengthLoad, lc = params.leverLengthCW;
+  const bOffZ = config.ballOffsetZ || 0, bOffY = config.ballOffsetY || 0;
+  const rEff = Math.sqrt(bOffY * bOffY + (-ll + bOffZ) * (-ll + bOffZ));
   const totalLen = ll + lc;
-  const I = armM * totalLen * totalLen / 12 + mp * ll * ll;
+  const I = armM * totalLen * totalLen / 12 + mp * rEff * rEff;
   const theta = params.releaseAngle * RAD;
   const work = params.motorTorque * theta;
   const omegaIdeal = Math.sqrt(2 * work / I);
   const omega = Math.min(omegaIdeal, 30); // motor target speed cap
-  const v = omega * ll;
+  const v = omega * rEff;
   const launchRad = (135 - params.releaseAngle) * RAD;
   return { v, launchRad, g };
 }
@@ -2420,13 +2422,13 @@ function initGUI() {
   posFolder.open();
 
   const mechFolder = gui.addFolder('Mechanism');
-  mechFolder.add(config, 'pivotHeight', 0.3, 2.0, 0.01).name('Pivot Height (m)').onChange(() => {
+  mechFolder.add(config, 'pivotHeight', 0.3, 2.5, 0.01).name('Pivot Height (m)').onChange(() => {
     if (!fired && !validator.running) resetSim();
   });
-  mechFolder.add(config, 'leverLengthLoad', 0.3, 2.0, 0.01).name('Lever Load (m)').onChange(() => {
+  mechFolder.add(config, 'leverLengthLoad', 0.3, 3.0, 0.01).name('Lever Load (m)').onChange(() => {
     if (!fired && !validator.running) resetSim();
   });
-  mechFolder.add(config, 'leverLengthCW', 0.2, 1.5, 0.01).name('Lever CW (m)').onChange(() => {
+  mechFolder.add(config, 'leverLengthCW', 0.2, 2.0, 0.01).name('Lever CW (m)').onChange(() => {
     if (!fired && !validator.running) resetSim();
   });
   mechFolder.add(config, 'motorTorque', 5, 200, 0.5).name('Motor Torque (Nm)').onChange(() => {

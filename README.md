@@ -86,14 +86,22 @@ Manual and AI-powered training sim. The robot arm fires a baseball at a 3m × 3.
 | **📨 Suggest to AI** | Seed current settings into the AI population |
 | **🗑 Wipe Data** | Clear all accumulated training data |
 
-### AI Strategy
+### AI Training Parameters
 
-- **Progressive per-target training** — trains on one hole at a time (center out, easiest to hardest)
-- **Population**: 6 individuals, 2 elites, 8 trials per individual
-- **Mutation**: Directional mutation biased by where the ball missed (dz, dx, dy)
-- **KNN acceleration**: Uses all past trials to guide mutation toward high-performing regions
-- **Param avoidance**: Learns which parameter regions produce poor results and avoids them
-- **Fitness**: `simAcc × 0.55 + physicsScore × 0.2 + trajectoryAcc × 0.25 + proximityBonus − avoidance penalty + KNN bonus`
+The AI optimizes 8 parameters. Ranges widened (2026-07-02) to account for CAD ball‑offset calibration:
+
+| Parameter | Range | Notes |
+|---|---|---|
+| **heading** | -20° to 20° | |
+| **motorTorque** | 5–200 Nm | |
+| **releaseAngle** | 75° to 115° | |
+| **pivotHeight** | 0.3–2.5 m | Now mutable by AI |
+| **leverLengthLoad** | 0.4–3.0 m | Now mutable by AI; effective radius ≈ `√(0.105² + (ll−0.669)²)` |
+| **leverLengthCW** | 0.2–2.0 m | Now mutable by AI |
+
+> **Critical fix**: The CAD‑calibrated `ballOffsetZ = 0.669` reduced the effective lever arm from `ll` to `√(0.105² + (ll−0.669)²)`. The analytical prediction used `v = ω·ll` (overestimating range by ≈7×), while the physics simulation used the correct (much shorter) radius. Both now use the effective radius, and the `leverLengthLoad` range was widened to `[0.4, 3.0]` to compensate.
+
+### AI Strategy
 
 ### Diagnostics
 

@@ -1529,9 +1529,9 @@ function initGUI() {
   posFolder.open();
 
   const mechFolder = gui.addFolder('Mechanism');
-  mechFolder.add(config, 'pivotHeight', 0.3, 2.0, 0.01).name('Pivot Height (m)');
-  mechFolder.add(config, 'leverLengthLoad', 0.3, 2.0, 0.01).name('Lever Load (m)');
-  mechFolder.add(config, 'leverLengthCW', 0.2, 1.5, 0.01).name('Lever CW (m)');
+  mechFolder.add(config, 'pivotHeight', 0.3, 2.5, 0.01).name('Pivot Height (m)');
+  mechFolder.add(config, 'leverLengthLoad', 0.3, 3.0, 0.01).name('Lever Load (m)');
+  mechFolder.add(config, 'leverLengthCW', 0.2, 2.0, 0.01).name('Lever CW (m)');
   mechFolder.add(config, 'motorTorque', 5, 200, 0.5).name('Motor Torque (Nm)');
   mechFolder.open();
 
