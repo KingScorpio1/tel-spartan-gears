@@ -159,6 +159,7 @@ Head-to-head 1v1 match simulation between the player's robot (blue) and a rival 
 - **Space** fires the player robot once positioned
 - First half: AI only (both robots navigate and fire autonomously)
 - Second half: Full 1v1 with both robots firing; player can manually reposition with WASD
+- **Validation-powered params**: On load, reads best validated/trained params from `localStorage` (priority: validated targets → saved training sets → best training params). Both robots share the optimized mechanism settings.
 
 ### Player Robot Controls
 

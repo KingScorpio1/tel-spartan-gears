@@ -2597,7 +2597,7 @@ document.addEventListener('keydown', (e) => {
   else if (key === 'ArrowLeft') { if (!fired) { config.posX -= 0.02; buildTrebuchet(); } }
   else if (key === 'ArrowRight') { if (!fired) { config.posX += 0.02; buildTrebuchet(); } }
   else if (key === ' ' || key === 'Space') { e.preventDefault(); fireTrebuchet(); }
-  else if (key === 'r' || key === 'R') { if (!fired) resetSim(); }
+  else if (key === 'r' || key === 'R') { resetSim(); }
   // View shortcuts (uppercase = Shift+key)
   else if (key === 'T') {
     camera.position.set(0, 12, 4); controls.target.set(0, 0.5, 4); controls.update();

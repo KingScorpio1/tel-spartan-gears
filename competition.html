@@ -140,6 +140,49 @@ const rivalConfig = {
   heading: 0,
 };
 
+// Load best params from validation/training localStorage
+function loadBestParams() {
+  const best = {};
+  const paramKeys = ['posX','posZ','heading','pivotHeight','motorTorque','leverLengthLoad','leverLengthCW','releaseAngle'];
+
+  // Priority 1: validatedTargets from validation arena (most reliable)
+  try {
+    const valData = JSON.parse(localStorage.getItem('trebuchet_validation'));
+    if (valData && valData.validatedTargets && valData.validatedTargets.length > 0) {
+      const sorted = [...valData.validatedTargets].sort((a, b) => b.level - a.level || b.acc - a.acc);
+      const vp = sorted[0].params;
+      for (const k of paramKeys) if (vp[k] !== undefined) best[k] = vp[k];
+      log(`Loaded validated params (level ${sorted[0].level}, acc ${(sorted[0].acc*100).toFixed(0)}%)`);
+      Object.assign(config, best);
+      return;
+    }
+  } catch(e) {}
+
+  // Priority 2: savedSets from training (fitness >= 0.95)
+  try {
+    const trainData = JSON.parse(localStorage.getItem('trebuchet_ai_training'));
+    if (trainData) {
+      if (trainData.savedSets && trainData.savedSets.length > 0) {
+        const sp = trainData.savedSets[0].params;
+        for (const k of paramKeys) if (sp[k] !== undefined) best[k] = sp[k];
+        log(`Loaded saved params from training (fitness ${(trainData.savedSets[0].fitness*100).toFixed(0)}%)`);
+        Object.assign(config, best);
+        return;
+      }
+      if (trainData.bestParams) {
+        const bp = trainData.bestParams;
+        for (const k of paramKeys) if (bp[k] !== undefined) best[k] = bp[k];
+        log('Loaded best params from training memory.');
+        Object.assign(config, best);
+        return;
+      }
+    }
+  } catch(e) {}
+
+  log('No saved params found. Using defaults.');
+  Object.assign(config, best);
+}
+
 // ===== Game State Machine =====
 const STATE = {
   WAITING: 'WAITING',
@@ -1644,7 +1687,7 @@ document.addEventListener('keydown', (e) => {
       }, 300);
     }
   }
-  else if (key === 'r' || key === 'R') { fullReset(); }
+  else if (key === 'r' || key === 'R') { e.preventDefault(); fullReset(); }
   // View shortcuts (uppercase = Shift+key to avoid WASD conflict)
   else if (key === 'T') {
     camera.position.set(0, 12, 4); controls.target.set(0, 0.5, 4); controls.update();
@@ -1667,6 +1710,10 @@ buildArena();
 buildFieldBarriers();
 buildStartingBoxes();
 buildTargetBoard();
+
+// Load best params from training/validation before building robots
+loadBestParams();
+
 createPlayerRobot();
 createRivalRobot();
 trailData = buildTrails();
