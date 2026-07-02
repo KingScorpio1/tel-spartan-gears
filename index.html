@@ -1233,11 +1233,54 @@ function checkLanding() {
       log('No target hit.');
     }
 
+    // Save trajectory for 3D viewer regardless of mode
+    saveTrajectory(hasHit, { x: pos.x, z: pos.z });
+    // Feed hits to validation queue (manual mode)
+    if (!AI.running && hasHit) {
+      feedValidationQueue(config, true, { x: pos.x, z: pos.z });
+    }
     // Evolutionary AI: record trial result
     if (AI.running) {
       AIrecordTrial(hasHit, { x: pos.x, z: pos.z });
     }
   }
+}
+
+// Feed hit param sets to validation queue for auto-validation
+function feedValidationQueue(params, hit, pos) {
+  if (!hit) return;
+  try {
+    const key = 'trebuchet_validation_queue';
+    const raw = localStorage.getItem(key);
+    const queue = raw ? JSON.parse(raw) : [];
+    const paramKey = JSON.stringify(params);
+    const existing = queue.find(q => JSON.stringify(q.params) === paramKey);
+    if (existing) {
+      existing.hits++;
+      existing.total++;
+      if (pos) { existing.landZ = pos.z; existing.landX = pos.x; }
+    } else {
+      queue.push({ params: { ...params }, hits: 1, total: 1, landZ: pos ? pos.z : null, landX: pos ? pos.x : null, ts: Date.now() });
+    }
+    if (queue.length > 100) queue.splice(0, queue.length - 100);
+    localStorage.setItem(key, JSON.stringify(queue));
+    localStorage.setItem('trebuchet_validation_queue_ts', Date.now().toString());
+  } catch(e) {}
+}
+
+// Save current trajectory to trainingTrajectories for 3D viewer
+function saveTrajectory(hit, pos) {
+  if (trajectoryPoints.length === 0) return;
+  const pts = trajectoryPoints;
+  const maxPts = 200;
+  const step = Math.max(3, Math.floor(pts.length / 3 / maxPts) * 3);
+  const sampled = [];
+  for (let i = 0; i < pts.length; i += step) {
+    if (i + 2 < pts.length) sampled.push(pts[i], pts[i + 1], pts[i + 2]);
+  }
+  const targetId = hit && hitTargets.length > 0 ? hitTargets[0].id : null;
+  trainingTrajectories.push({ points: sampled, hit, targetId, landZ: pos ? pos.z : null });
+  if (trainingTrajectories.length > 500) trainingTrajectories.splice(0, trainingTrajectories.length - 500);
 }
 
 // ===== Evolutionary AI System =====
@@ -2409,24 +2452,15 @@ function AIrecordTrial(hit, pos) {
   recordParamBins(cur.params, hit);
   AI.totalTrials++;
 
-  // Save trajectory for 3D chart (downsampled)
-  if (trajectoryPoints.length > 0) {
-    const pts = trajectoryPoints;
-    const maxPts = 200;
-    const step = Math.max(3, Math.floor(pts.length / 3 / maxPts) * 3);
-    const sampled = [];
-    for (let i = 0; i < pts.length; i += step) {
-      if (i + 2 < pts.length) sampled.push(pts[i], pts[i + 1], pts[i + 2]);
-    }
-    trainingTrajectories.push({ points: sampled, hit: hitCurrent, targetId, landZ: pos ? pos.z : null });
-    // Keep last 500 trajectories
-    if (trainingTrajectories.length > 500) trainingTrajectories.splice(0, trainingTrajectories.length - 500);
-  }
+  // Save trajectory for 3D chart (downsampled) — use actual hit flag, not hitCurrent
+  saveTrajectory(hit, pos);
   trainingData.totalTrials = AI.totalTrials;
   trainingData.bestAccuracy = AI.bestAccuracy;
   trainingData.bestParams = AI.bestParams;
   trainingData.savedSets = AI.savedSets;
   saveTraining();
+  // Feed hit params to validation queue for auto-validation pipeline
+  if (hit) feedValidationQueue(cur.params, true, pos);
   rebuildKNN();
 
   // Accumulate trajectory error relative to the current target hole position

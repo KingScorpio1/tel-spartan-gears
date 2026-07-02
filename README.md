@@ -126,7 +126,16 @@ Automated testing of parameter sets to find configurations that **reliably** hit
 | 4 | 6 |
 | 5 | 3 |
 
-### Workflow
+### Auto-Pipeline
+
+The training, validation, and competition arenas form an automated pipeline:
+
+1. **Training → Validation**: Every hit in the training arena (manual or AI) writes its params to a `trebuchet_validation_queue` in localStorage
+2. **Validation auto-polls**: `validate.html` polls every 3 seconds, merges new param sets, and auto-starts validation (if not already running)
+3. **Validation → Competition**: When a param set achieves ≥95% accuracy on a target, it's written to `trebuchet_competition_params` (only overwrites if better level/accuracy)
+4. **Competition loads pipeline params**: `competition.html` reads `trebuchet_competition_params` as its highest-priority source
+
+### Manual Workflow
 
 1. **Load from Memory** — imports trained sets from the training arena (localStorage)
 2. **Import CSV** — or load sets from a CSV file
@@ -167,7 +176,7 @@ Head-to-head 1v1 match simulation between the player's robot (blue) and a rival 
 - **Space** fires the player robot once positioned
 - First half: AI only (both robots navigate and fire autonomously)
 - Second half: Full 1v1 with both robots firing; player can manually reposition with WASD
-- **Validation-powered params**: On load, reads best validated/trained params from `localStorage` (priority: validated targets → saved training sets → best training params). Both robots share the optimized mechanism settings.
+- **Validation-powered params**: On load, reads best validated/trained params from `localStorage` (priority: auto-pipeline `trebuchet_competition_params` → validated targets → saved training sets → best training params). Both robots share the optimized mechanism settings.
 
 ### Player Robot Controls
 

@@ -145,6 +145,18 @@ function loadBestParams() {
   const best = {};
   const paramKeys = ['posX','posZ','heading','pivotHeight','motorTorque','leverLengthLoad','leverLengthCW','releaseAngle'];
 
+  // Priority 0: competition-ready params from auto-validation pipeline
+  try {
+    const compRaw = localStorage.getItem('trebuchet_competition_params');
+    if (compRaw) {
+      const cp = JSON.parse(compRaw);
+      for (const k of paramKeys) if (cp[k] !== undefined) best[k] = cp[k];
+      log(`Loaded competition-ready params (pipeline).`);
+      Object.assign(config, best);
+      return;
+    }
+  } catch(e) {}
+
   // Priority 1: validatedTargets from validation arena (most reliable)
   try {
     const valData = JSON.parse(localStorage.getItem('trebuchet_validation'));

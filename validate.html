@@ -2217,9 +2217,11 @@ function VrecordTrial(hit, pos) {
       } else {
         validator.validatedCounts[tgt][validator.validationLevel]++;
       }
-      log(`✓ Target ${tgt} VALIDATED at level ${validator.validationLevel}: ${validator.hitsOnTarget}/${validator.levelTrials} (${(setAcc * 100).toFixed(1)}%)`);
-      reportToTraining();
-      saveTraining();
+  log(`✓ Target ${tgt} VALIDATED at level ${validator.validationLevel}: ${validator.hitsOnTarget}/${validator.levelTrials} (${(setAcc * 100).toFixed(1)}%)`);
+  reportToTraining();
+  saveTraining();
+  // Write to competition params if this is a high-confidence validation
+  pushToCompetition(set.params, setAcc, validator.validationLevel);
       validator.currentTargetIdx++;
       validator.currentSetIdx = 0;
       validator._bestAcc = 0;
@@ -2554,6 +2556,72 @@ document.getElementById('csvInput').addEventListener('change', function() {
   importCSVHandler(this.files);
 });
 
+// ===== Auto-Pipeline: receive from training, push to competition =====
+function pushToCompetition(params, acc, level) {
+  try {
+    const bestKey = 'trebuchet_competition_params';
+    const existing = localStorage.getItem(bestKey);
+    const best = existing ? JSON.parse(existing) : null;
+    // Only overwrite if better: higher level, or same level with better accuracy
+    const isBetter = !best ||
+      (level > (best._level || 0)) ||
+      (level === (best._level || 0) && acc >= (best._acc || 0));
+    if (isBetter) {
+      const payload = { ...params, _acc: acc, _level: level, _ts: Date.now() };
+      localStorage.setItem(bestKey, JSON.stringify(payload));
+      log(`→ Pushed params to competition (${(acc*100).toFixed(1)}% @ L${level})`);
+    }
+  } catch(e) {}
+}
+
+function pullValidationQueue() {
+  try {
+    const raw = localStorage.getItem('trebuchet_validation_queue');
+    const ts = localStorage.getItem('trebuchet_validation_queue_ts');
+    if (!raw || !ts) return;
+    const lastPullKey = '_last_queue_pull_ts';
+    const lastPull = localStorage.getItem(lastPullKey) || '0';
+    if (ts === lastPull) return; // nothing new
+    localStorage.setItem(lastPullKey, ts);
+
+    const queue = JSON.parse(raw);
+    let newSets = 0;
+    for (const item of queue) {
+      const key = JSON.stringify(item.params);
+      const existing = validator.sets.some(s => JSON.stringify(s.params) === key);
+      if (!existing &&
+          item.hits > 0 &&
+          item.total <= VAL_LEVEL_TRIALS[0] * 2) { // only auto-load recently queued
+        validator.sets.push({ params: { ...item.params }, label: `q_${item.ts}` });
+        newSets++;
+      }
+    }
+    if (newSets > 0) {
+      log(`Auto-loaded ${newSets} new parameter set(s) from training queue.`);
+      // Initialize results
+      for (const s of validator.sets) {
+        const k = JSON.stringify(s.params);
+        if (!validator.results[k]) {
+          validator.results[k] = { params: { ...s.params }, hits: 0, total: 0, targetHits: {}, targetTotal: {}, landZ: [], landX: [], boardY: [], trajectories: [] };
+        }
+      }
+      saveTraining();
+      // Auto-start if not running
+      if (!validator.running && validator.sets.length > 0) {
+        log('Auto-starting validation with new sets...');
+        Vstart();
+      }
+    }
+  } catch(e) {}
+}
+
+// Poll the validation queue every 3 seconds
+let _queuePoller = null;
+function startQueuePolling() {
+  if (_queuePoller) return;
+  _queuePoller = setInterval(pullValidationQueue, 3000);
+}
+
 // ===== START =====
 initScene();
 const mats = initPhysics();
@@ -2610,6 +2678,7 @@ document.addEventListener('keydown', (e) => {
 });
 
 animate();
+startQueuePolling();
 
 log('Validation Arena loaded. WASD Move • QE Rotate • Space Fire • R Reset • Shift+T Top • Shift+S Side');
 setStatus('Ready. WASD Position, Space Fire, R Reset');
