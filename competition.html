@@ -1356,31 +1356,27 @@ function updateGame(dt) {
       const headingRad = config.heading * RAD;
 
       if (keys['w'] || keys['arrowup']) {
-        config.posX += Math.sin(headingRad) * speed;
-        config.posZ += Math.cos(headingRad) * speed;
+        config.posZ += speed;
         moved = true;
       }
       if (keys['s'] || keys['arrowdown']) {
-        config.posX -= Math.sin(headingRad) * speed;
-        config.posZ -= Math.cos(headingRad) * speed;
+        config.posZ -= speed;
         moved = true;
       }
       if (keys['a'] || keys['arrowleft']) {
-        config.posX += Math.cos(headingRad) * speed;
-        config.posZ -= Math.sin(headingRad) * speed;
+        config.posX -= speed;
         moved = true;
       }
       if (keys['d'] || keys['arrowright']) {
-        config.posX -= Math.cos(headingRad) * speed;
-        config.posZ += Math.sin(headingRad) * speed;
+        config.posX += speed;
         moved = true;
       }
       if (keys['q']) {
-        config.heading -= rotSpeed;
+        config.heading += rotSpeed;
         moved = true;
       }
       if (keys['e']) {
-        config.heading += rotSpeed;
+        config.heading -= rotSpeed;
         moved = true;
       }
 
