@@ -10,7 +10,11 @@ python server.py
 
 Then open [http://localhost:8765](http://localhost:8765) (training), [http://localhost:8765/validate.html](http://localhost:8765/validate.html) (validation), or [http://localhost:8765/competition.html](http://localhost:8765/competition.html) (competition).
 
-Or double-click `start.bat` (training), `start_validate.bat` (validation), or `start_competition.bat` (competition).
+Or double-click:
+- `start_all.bat` — opens all three arenas at once
+- `start.bat` — training only
+- `start_validate.bat` — validation only
+- `start_competition.bat` — competition only
 
 ## Keyboard Shortcuts
 
@@ -210,8 +214,10 @@ sim/
 ├── validate.html           Validation arena
 ├── competition.html        Head-to-head competition arena
 ├── server.py               Python HTTP server (port 8765)
+├── start_all.bat           Launch all three arenas at once
 ├── start.bat               Launch training
 ├── start_validate.bat      Launch validation
+├── start_competition.bat   Launch head-to-head competition
 ├── models/                 3D GLB models (robot arm, base)
 ├── .gitignore
 └── README.md
